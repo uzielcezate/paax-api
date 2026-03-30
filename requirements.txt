@@ -1,0 +1,5 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+ytmusicapi==1.7.4
+python-multipart==0.0.9
+redis==5.0.8
