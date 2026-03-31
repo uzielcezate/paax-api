@@ -582,4 +582,7 @@ def remove_playlist_items(playlistId: str, videoIds: List[str] = Body(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8080))
+    print(f"[paax-api] Starting server on http://0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
