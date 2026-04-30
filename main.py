@@ -486,34 +486,27 @@ def get_album(browseId: str):
                     if a.get("name") and not _VIEW_COUNT_RE.match(a["name"].strip())
                 ]
 
-                if not valid_artists:
-                    vid = track.get("videoId", "")
-                    if vid:
-                        try:
-                            watch = yt.get_watch_playlist(videoId=vid)
-                            if watch and "tracks" in watch and watch["tracks"]:
-                                w_track = watch["tracks"][0]
+                vid = track.get("videoId", "")
+                if vid:
+                    try:
+                        watch = yt.get_watch_playlist(videoId=vid)
+                        if watch and "tracks" in watch and watch["tracks"]:
+                            w_track = watch["tracks"][0]
+
+                            # Always correct OMV → ATV videoId
+                            w_vid = w_track.get("videoId", "")
+                            if w_vid and w_vid != vid:
+                                print(f"[Album Enrich] videoId corrected: {vid} -> {w_vid}")
+                                track["videoId"] = w_vid
+
+                            # Only adopt watch artists if track had none
+                            if not valid_artists:
                                 w_artists = w_track.get("artists") or []
                                 if w_artists:
                                     track["artists"] = w_artists
-                                w_vid = w_track.get("videoId", "")
-                                if w_vid and w_vid != vid:
-                                    track["videoId"] = w_vid
-                        except Exception:
-                            if album_artists:
-                                track["artists"] = album_artists
-
-            # Promote enriched track artists to album level if richer
-            for track in data["tracks"]:
-                t_artists = track.get("artists") or []
-                real = [
-                    a for a in t_artists
-                    if a.get("name") and not _VIEW_COUNT_RE.match(a["name"].strip())
-                ]
-                if len(real) > len(album_artists):
-                    data["artists"] = real
-                    album_artists = real
-                    break
+                    except Exception:
+                        if not valid_artists and album_artists:
+                            track["artists"] = album_artists
 
         return data
     except Exception as e:
