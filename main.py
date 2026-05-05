@@ -26,10 +26,11 @@ from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 import os
 import json
+import time
 import tempfile
 import asyncio
 import datetime
-from cache import get_redis_client, make_cache_key, cache_get, cache_set
+from cache import get_redis_client, make_cache_key, cache_get, cache_set, get_memory_cache_stats
 from ytmusicapi.navigation import nav, SINGLE_COLUMN_TAB, SECTION_LIST_ITEM, GRID_ITEMS, GRID, CAROUSEL_CONTENTS
 from ytmusicapi.parsers.library import parse_albums
 try:
@@ -163,7 +164,11 @@ async def cache_status():
             redis_ok = True
         except Exception:
             pass
-    return {"redis_enabled": redis_enabled, "redis_ok": redis_ok}
+    return {
+        "redis_enabled": redis_enabled,
+        "redis_ok": redis_ok,
+        "memory_cache": get_memory_cache_stats(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +200,10 @@ def reload_auth():
 # Search
 # ---------------------------------------------------------------------------
 
-_TTL_SEARCH = 900    # 15 minutes
-_TTL_HOME   = 21600  # 6 hours
+_TTL_SEARCH  = 900     # 15 minutes
+_TTL_HOME    = 21600   # 6 hours
+_TTL_ARTIST  = 21600   # 6 hours
+_TTL_ALBUM   = 86400   # 24 hours
 
 
 @app.get("/search")
@@ -362,11 +369,23 @@ def get_home_top(genre: str, country: str = "US"):
 # ---------------------------------------------------------------------------
 
 @app.get("/artist/{channelId}")
-def get_artist(channelId: str):
+async def get_artist(channelId: str):
+    cache_key = make_cache_key("artist", {"id": channelId})
+    cached    = await cache_get(redis_client, cache_key)
+    if cached is not None:
+        print(f"[Cache] HIT {cache_key}")
+        return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+
+    t0 = time.time()
     try:
-        return yt.get_artist(channelId)
+        data = yt.get_artist(channelId)
+        elapsed = time.time() - t0
+        print(f"[Perf] /artist/{channelId} fetched in {elapsed:.2f}s [MISS]")
+        await cache_set(redis_client, cache_key, data, _TTL_ARTIST)
+        return JSONResponse(content=data, headers={"X-Cache": "MISS"})
     except Exception as e:
-        print(f"Error fetching artist {channelId}: {e}")
+        elapsed = time.time() - t0
+        print(f"[Perf] /artist/{channelId} FAILED in {elapsed:.2f}s: {e}")
         return {
             "name": "Artist (Error)", "channelId": channelId,
             "thumbnails": [],
@@ -434,7 +453,14 @@ def get_artist_albums_page(channelId: str, params: str = None, ctoken: str = Non
 # ---------------------------------------------------------------------------
 
 @app.get("/album/{browseId}")
-def get_album(browseId: str):
+async def get_album(browseId: str):
+    cache_key = make_cache_key("album", {"id": browseId})
+    cached    = await cache_get(redis_client, cache_key)
+    if cached is not None:
+        print(f"[Cache] HIT {cache_key}")
+        return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+
+    t0 = time.time()
     try:
         data = None
         try:
@@ -508,8 +534,13 @@ def get_album(browseId: str):
                         if not valid_artists and album_artists:
                             track["artists"] = album_artists
 
-        return data
+        elapsed = time.time() - t0
+        print(f"[Perf] /album/{browseId} fetched in {elapsed:.2f}s [MISS]")
+        await cache_set(redis_client, cache_key, data, _TTL_ALBUM)
+        return JSONResponse(content=data, headers={"X-Cache": "MISS"})
     except Exception as e:
+        elapsed = time.time() - t0
+        print(f"[Perf] /album/{browseId} FAILED in {elapsed:.2f}s: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
