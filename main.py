@@ -565,7 +565,8 @@ def get_song_related(videoId: str):
 
 
 @app.get("/lyrics/{videoId}")
-def get_lyrics(videoId: str):
+def get_lyrics_legacy(videoId: str):
+    """Legacy endpoint — redirects to new unified /lyrics."""
     try:
         watch = yt.get_watch_playlist(videoId=videoId)
         if watch.get("lyrics"):
@@ -573,6 +574,242 @@ def get_lyrics(videoId: str):
         return {"error": "No lyrics found"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Title normalization for lyrics search
+# ---------------------------------------------------------------------------
+
+import re
+import httpx
+
+_NOISE_PATTERNS = [
+    r"\(Official\s+Video\)",
+    r"\(Official\s+Audio\)",
+    r"\(Official\s+Music\s+Video\)",
+    r"\(Visualizer\)",
+    r"\(Lyric\s+Video\)",
+    r"\(Lyrics?\)",
+    r"\(Audio\)",
+    r"\(Video\s+Oficial\)",
+    r"\(Audio\s+Oficial\)",
+    r"\[Official\s+Video\]",
+    r"\[Official\s+Audio\]",
+    r"\[Official\s+Music\s+Video\]",
+    r"- Remastered\s*\d*",
+    r"\(Remastered\s*\d*\)",
+    r"\(4K\)",
+    r"\(HD\)",
+    r"4K\s*$",
+    r"HD\s*$",
+]
+_NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE)
+
+
+def _normalize_title(raw: str) -> str:
+    """Strip YouTube noise tags while preserving Remix, Feat, Ft, Vol, Pt."""
+    cleaned = _NOISE_RE.sub("", raw)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+# ---------------------------------------------------------------------------
+# LRC timestamp parser
+# ---------------------------------------------------------------------------
+
+_LRC_LINE_RE = re.compile(
+    r"^\[(\d{1,3}):(\d{2})[\.:](\d{2,3})\]\s*(.*)"
+)
+
+
+def _parse_lrc(lrc_text: str) -> list:
+    """Parse LRC format into list of {timeMs, text} dicts."""
+    lines = []
+    for raw in lrc_text.split("\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        m = _LRC_LINE_RE.match(raw)
+        if not m:
+            continue
+        minutes = int(m.group(1))
+        seconds = int(m.group(2))
+        frac_str = m.group(3)
+        frac_ms = int(frac_str) if len(frac_str) == 3 else int(frac_str) * 10
+        time_ms = (minutes * 60 + seconds) * 1000 + frac_ms
+        text = (m.group(4) or "").strip()
+        lines.append({"timeMs": time_ms, "text": text})
+
+    # Compute endTimeMs for each line
+    for i in range(len(lines)):
+        if i < len(lines) - 1:
+            lines[i]["endTimeMs"] = lines[i + 1]["timeMs"]
+        else:
+            lines[i]["endTimeMs"] = None
+
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Unified lyrics endpoint: LRCLIB primary → ytmusicapi fallback
+# ---------------------------------------------------------------------------
+
+@app.get("/lyrics")
+async def get_lyrics_unified(
+    trackId: str = Query(default=""),
+    title: str = Query(default=""),
+    artist: str = Query(default=""),
+    album: str = Query(default=""),
+    duration: int = Query(default=0, description="Duration in seconds"),
+):
+    """
+    Unified lyrics endpoint.
+    
+    Priority:
+      1. LRCLIB /api/get (exact match by title + artist + album + duration)
+      2. LRCLIB /api/search (fuzzy search, pick best duration match)
+      3. ytmusicapi lyrics (plain text fallback via trackId/videoId)
+    
+    Returns:
+      - type: "synced" | "plain"
+      - lyrics: list[{timeMs, endTimeMs, text}] for synced, or str for plain
+      - source: "lrclib" | "ytmusicapi"
+      - lyricsAvailable: bool
+    """
+    norm_title = _normalize_title(title)
+    norm_artist = _normalize_title(artist)
+
+    # ── 1. LRCLIB exact match ──
+    if norm_title and norm_artist:
+        result = await _try_lrclib_get(norm_title, norm_artist, album, duration)
+        if result:
+            return result
+
+        # ── 2. LRCLIB search fallback ──
+        result = await _try_lrclib_search(norm_title, norm_artist, duration)
+        if result:
+            return result
+
+    # ── 3. ytmusicapi fallback ──
+    if trackId:
+        result = _try_ytmusic_lyrics(trackId)
+        if result:
+            return result
+
+    # ── 4. No lyrics ──
+    return {"lyricsAvailable": False}
+
+
+async def _try_lrclib_get(title: str, artist: str, album: str, duration: int):
+    """LRCLIB exact match via /api/get."""
+    try:
+        params = {"track_name": title, "artist_name": artist}
+        if album:
+            params["album_name"] = album
+        if duration > 0:
+            params["duration"] = str(duration)
+
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(
+                "https://lrclib.net/api/get",
+                params=params,
+                headers={"User-Agent": "Paax Music v1.0 (https://paaxmusic.app)"},
+            )
+
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json()
+        return _process_lrclib_result(data)
+    except Exception as e:
+        print(f"[Lyrics/LRCLIB/get] Error: {e}")
+        return None
+
+
+async def _try_lrclib_search(title: str, artist: str, duration: int):
+    """LRCLIB fuzzy search via /api/search, pick best duration match."""
+    try:
+        q = f"{artist} {title}"
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.get(
+                "https://lrclib.net/api/search",
+                params={"q": q},
+                headers={"User-Agent": "Paax Music v1.0 (https://paaxmusic.app)"},
+            )
+
+        if resp.status_code != 200:
+            return None
+
+        results = resp.json()
+        if not isinstance(results, list) or not results:
+            return None
+
+        # Find best match: prefer synced, closest duration
+        best = None
+        best_score = float("inf")
+        for item in results:
+            has_synced = bool(item.get("syncedLyrics", "").strip())
+            item_dur = item.get("duration", 0) or 0
+            dur_diff = abs(item_dur - duration) if duration > 0 else 0
+            # Score: lower is better. Synced gets -10000 bonus
+            score = dur_diff - (10000 if has_synced else 0)
+            if score < best_score:
+                best_score = score
+                best = item
+
+        if best:
+            return _process_lrclib_result(best)
+        return None
+    except Exception as e:
+        print(f"[Lyrics/LRCLIB/search] Error: {e}")
+        return None
+
+
+def _process_lrclib_result(data: dict):
+    """Process a single LRCLIB result into our response format."""
+    # Prefer synced lyrics
+    synced_raw = (data.get("syncedLyrics") or "").strip()
+    if synced_raw:
+        lines = _parse_lrc(synced_raw)
+        if lines:
+            return {
+                "lyricsAvailable": True,
+                "type": "synced",
+                "source": "lrclib",
+                "lyrics": lines,
+            }
+
+    # Fallback to plain lyrics
+    plain_raw = (data.get("plainLyrics") or "").strip()
+    if plain_raw:
+        return {
+            "lyricsAvailable": True,
+            "type": "plain",
+            "source": "lrclib",
+            "lyrics": plain_raw,
+        }
+
+    return None
+
+
+def _try_ytmusic_lyrics(video_id: str):
+    """ytmusicapi plain lyrics fallback."""
+    try:
+        watch = yt.get_watch_playlist(videoId=video_id)
+        if not watch.get("lyrics"):
+            return None
+        result = yt.get_lyrics(browseId=watch["lyrics"])
+        lyrics_text = (result.get("lyrics") or "").strip()
+        if not lyrics_text:
+            return None
+        return {
+            "lyricsAvailable": True,
+            "type": "plain",
+            "source": "ytmusicapi",
+            "lyrics": lyrics_text,
+        }
+    except Exception as e:
+        print(f"[Lyrics/YTMusic] Error: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
