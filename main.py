@@ -1062,18 +1062,56 @@ async def v2_get_track(track_id: int):
 
 @app.get("/v2/chart")
 async def v2_get_chart():
-    """Deezer chart data (top tracks, albums, artists)."""
+    """Deezer chart data (top tracks with YouTube IDs, albums, artists)."""
+    cache_key = make_cache_key("v2_chart", {})
+    cached = await cache_get(redis_client, cache_key)
+    if cached is not None:
+        return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+
     try:
         from services.deezer.deezer_mapper import map_track, map_album, map_artist
 
         dz = await deezer_client.get_chart()
-        tracks = [map_track(t) for t in (dz.get("tracks", {}).get("data", []))]
+
+        # ── Chart tracks with YouTube matching ────────────────────────────
+        raw_tracks = dz.get("tracks", {}).get("data", [])
+        _sem = asyncio.Semaphore(5)
+
+        async def resolve_chart_track(t):
+            artist_name = (t.get("artist") or {}).get("name", "")
+            title = t.get("title", "")
+            album_title = (t.get("album") or {}).get("title", "")
+            dur = t.get("duration", 0)
+            explicit = t.get("explicit_lyrics", False)
+            try:
+                async with _sem:
+                    pb = await asyncio.wait_for(
+                        yt_match_track(artist_name, title, album_title, dur, explicit),
+                        timeout=15.0,
+                    )
+            except asyncio.TimeoutError:
+                pb = {"videoId": None, "matchConfidence": 0.0, "matchStatus": "timeout"}
+            pb.setdefault("provider", "youtube")
+            pb.setdefault("engine", "iframe")
+            return map_track(t, playback=pb)
+
+        mapped_raw = await asyncio.gather(
+            *[resolve_chart_track(t) for t in raw_tracks],
+            return_exceptions=True,
+        )
+        tracks = [m for m in mapped_raw if not isinstance(m, Exception)]
+
+        # ── Albums and artists (no matching needed) ───────────────────────
         albums = [map_album(a) for a in (dz.get("albums", {}).get("data", []))]
         artists = [map_artist(a) for a in (dz.get("artists", {}).get("data", []))]
-        return {"tracks": tracks, "albums": albums, "artists": artists}
+
+        payload = {"tracks": tracks, "albums": albums, "artists": artists}
+        await cache_set(redis_client, cache_key, payload, _TTL_HOME)
+        return JSONResponse(content=payload, headers={"X-Cache": "MISS"})
     except Exception as e:
         print(f"[v2/chart] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.get("/v2/match")
