@@ -31,6 +31,18 @@ import tempfile
 import asyncio
 import datetime
 from cache import get_redis_client, make_cache_key, cache_get, cache_set, get_memory_cache_stats
+
+# ── Hybrid Deezer + YouTube services ──────────────────────────────────────────
+from services.deezer.deezer_client import DeezerClient
+from services.youtube.youtube_cache import init_cache as init_yt_cache
+from services.hybrid.hybrid_search import (
+    hybrid_search_tracks,
+    hybrid_search_albums,
+    hybrid_search_artists,
+)
+from services.hybrid.hybrid_artist import get_hybrid_artist
+from services.hybrid.hybrid_album import get_hybrid_album
+from services.youtube.youtube_matcher import match_track as yt_match_track
 from ytmusicapi.navigation import nav, SINGLE_COLUMN_TAB, SECTION_LIST_ITEM, GRID_ITEMS, GRID, CAROUSEL_CONTENTS
 from ytmusicapi.parsers.library import parse_albums
 try:
@@ -45,12 +57,13 @@ yt: YTMusic = None          # type: ignore
 _tmp_oauth_path: str | None = None
 _is_authenticated: bool     = False
 redis_client                = None  # initialised in lifespan
+deezer_client: DeezerClient = None  # type: ignore  # initialised in lifespan
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize YTMusic and Redis on startup; clean up on shutdown."""
-    global yt, _tmp_oauth_path, _is_authenticated, redis_client
+    global yt, _tmp_oauth_path, _is_authenticated, redis_client, deezer_client
 
     oauth_json_str = os.environ.get("YTMUSIC_OAUTH_JSON")
 
@@ -86,12 +99,24 @@ async def lifespan(app: FastAPI):
     redis_enabled   = redis_client is not None
     print(f"[Cache] Redis {'enabled' if redis_enabled else 'disabled'}.")
 
+    # Deezer client
+    deezer_client = DeezerClient()
+    print("[paax-api] DeezerClient initialized OK")
+
+    # YouTube match cache → share Redis connection
+    init_yt_cache(redis_client)
+    print("[paax-api] YouTube match cache initialized OK")
+
     yield  # App runs here
 
     # Cleanup
     if _tmp_oauth_path and os.path.exists(_tmp_oauth_path):
         os.unlink(_tmp_oauth_path)
         print("[paax-api] Cleaned up temp oauth file.")
+
+    if deezer_client:
+        await deezer_client.close()
+        print("[paax-api] DeezerClient closed.")
 
     if redis_client:
         await redis_client.aclose()
@@ -889,9 +914,187 @@ def remove_playlist_items(playlistId: str, videoIds: List[str] = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ===========================================================================
+# v2 Endpoints — Hybrid Deezer Metadata + YouTube Playback ID
+# ===========================================================================
+
+
+@app.get("/v2/search")
+async def v2_search(
+    q: str,
+    type: str = "tracks",
+    limit: int = 25,
+):
+    """
+    Hybrid search powered by Deezer metadata + YouTube video ID matching.
+
+    type: tracks | albums | artists
+    """
+    t = type.lower().strip()
+    try:
+        if t in ("tracks", "songs"):
+            return await hybrid_search_tracks(deezer_client, q, limit=limit)
+        elif t in ("albums",):
+            return await hybrid_search_albums(deezer_client, q, limit=limit)
+        elif t in ("artists",):
+            return await hybrid_search_artists(deezer_client, q, limit=limit)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown type: {type}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[v2/search] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/artist/{artist_id}")
+async def v2_get_artist(artist_id: int):
+    """Full artist profile from Deezer with YouTube-matched top tracks."""
+    cache_key = make_cache_key("v2_artist", {"id": artist_id})
+    cached = await cache_get(redis_client, cache_key)
+    if cached is not None:
+        return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+
+    try:
+        data = await get_hybrid_artist(deezer_client, artist_id)
+        await cache_set(redis_client, cache_key, data, _TTL_ARTIST)
+        return JSONResponse(content=data, headers={"X-Cache": "MISS"})
+    except Exception as e:
+        print(f"[v2/artist] Error for {artist_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/artist/{artist_id}/top")
+async def v2_get_artist_top(artist_id: int, limit: int = 50):
+    """Artist top tracks from Deezer with YouTube video IDs."""
+    try:
+        from services.deezer.deezer_mapper import map_track
+        import asyncio
+
+        dz = await deezer_client.get_artist_top(artist_id, limit=limit)
+        tracks_data = dz.get("data", [])
+
+        async def resolve(t):
+            artist = (t.get("artist") or {}).get("name", "")
+            title = t.get("title", "")
+            album_title = (t.get("album") or {}).get("title", "")
+            dur = t.get("duration", 0)
+            explicit = t.get("explicit_lyrics", False)
+            try:
+                pb = await asyncio.wait_for(
+                    yt_match_track(artist, title, album_title, dur, explicit),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                pb = {"videoId": None, "matchConfidence": 0.0, "matchStatus": "timeout"}
+            pb.setdefault("provider", "youtube")
+            pb.setdefault("engine", "iframe")
+            return map_track(t, playback=pb)
+
+        mapped = await asyncio.gather(*[resolve(t) for t in tracks_data], return_exceptions=True)
+        results = [m for m in mapped if not isinstance(m, Exception)]
+        return {"data": results}
+    except Exception as e:
+        print(f"[v2/artist/top] Error for {artist_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/artist/{artist_id}/albums")
+async def v2_get_artist_albums(artist_id: int, limit: int = 100):
+    """Artist albums from Deezer."""
+    try:
+        from services.deezer.deezer_mapper import map_album
+
+        dz = await deezer_client.get_artist_albums(artist_id, limit=limit)
+        albums_data = dz.get("data", [])
+        return {"data": [map_album(a) for a in albums_data]}
+    except Exception as e:
+        print(f"[v2/artist/albums] Error for {artist_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/album/{album_id}")
+async def v2_get_album(album_id: int):
+    """Full album details from Deezer with YouTube-matched tracks."""
+    cache_key = make_cache_key("v2_album", {"id": album_id})
+    cached = await cache_get(redis_client, cache_key)
+    if cached is not None:
+        return JSONResponse(content=cached, headers={"X-Cache": "HIT"})
+
+    try:
+        data = await get_hybrid_album(deezer_client, album_id)
+        await cache_set(redis_client, cache_key, data, _TTL_ALBUM)
+        return JSONResponse(content=data, headers={"X-Cache": "MISS"})
+    except Exception as e:
+        print(f"[v2/album] Error for {album_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/track/{track_id}")
+async def v2_get_track(track_id: int):
+    """Single track from Deezer with YouTube video ID."""
+    try:
+        from services.deezer.deezer_mapper import map_track
+
+        dz = await deezer_client.get_track(track_id)
+        artist = (dz.get("artist") or {}).get("name", "")
+        title = dz.get("title", "")
+        album_title = (dz.get("album") or {}).get("title", "")
+        duration = dz.get("duration", 0)
+        explicit = dz.get("explicit_lyrics", False)
+
+        try:
+            import asyncio
+            playback = await asyncio.wait_for(
+                yt_match_track(artist, title, album_title, duration, explicit),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            playback = {"videoId": None, "matchConfidence": 0.0, "matchStatus": "timeout"}
+
+        playback.setdefault("provider", "youtube")
+        playback.setdefault("engine", "iframe")
+        return map_track(dz, playback=playback)
+    except Exception as e:
+        print(f"[v2/track] Error for {track_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/chart")
+async def v2_get_chart():
+    """Deezer chart data (top tracks, albums, artists)."""
+    try:
+        from services.deezer.deezer_mapper import map_track, map_album, map_artist
+
+        dz = await deezer_client.get_chart()
+        tracks = [map_track(t) for t in (dz.get("tracks", {}).get("data", []))]
+        albums = [map_album(a) for a in (dz.get("albums", {}).get("data", []))]
+        artists = [map_artist(a) for a in (dz.get("artists", {}).get("data", []))]
+        return {"tracks": tracks, "albums": albums, "artists": artists}
+    except Exception as e:
+        print(f"[v2/chart] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v2/match")
+async def v2_match_debug(
+    artist: str = "",
+    title: str = "",
+    album: str = "",
+    duration: int = 0,
+):
+    """Debug endpoint: test YouTube matching for a given track."""
+    if not artist or not title:
+        raise HTTPException(status_code=400, detail="artist and title are required")
+    try:
+        result = await yt_match_track(artist, title, album, duration)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8080))
     print(f"[paax-api] Starting server on http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
