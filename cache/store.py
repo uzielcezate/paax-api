@@ -60,6 +60,9 @@ class MemoryCache:
         while len(self._cache) > self._max_size:
             self._cache.popitem(last=False)
 
+    def delete(self, key: str) -> None:
+        self._cache.pop(key, None)
+
     @property
     def stats(self) -> dict:
         return {
@@ -171,6 +174,16 @@ async def cache_set(redis, key: str, value: Any, ttl: int) -> None:
             await redis.set(key, serialized, ex=effective_ttl)
         except Exception as exc:
             logger.warning("[Cache] Redis SET error for key=%s: %s", key, exc)
+
+
+async def cache_delete(redis, key: str) -> None:
+    """Remove a key from both Redis and the in-memory fallback."""
+    _memory_cache.delete(key)
+    if redis is not None:
+        try:
+            await redis.delete(key)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[Cache] Redis DEL error for key=%s: %s", key, exc)
 
 
 def get_memory_cache_stats() -> dict:

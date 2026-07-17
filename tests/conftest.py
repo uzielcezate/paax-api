@@ -149,3 +149,46 @@ def catalog_tables() -> Dict[str, List[Dict[str, Any]]]:
 @pytest.fixture
 def gateway(catalog_tables):
     return FakeGateway(catalog_tables)
+
+
+class FakeRedis:
+    """Minimal async Redis for lock + cache tests (SET NX/EX, GET, DEL, EVAL)."""
+
+    def __init__(self):
+        self.store: Dict[str, Any] = {}
+
+    async def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return None
+        self.store[key] = value
+        return True
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def delete(self, *keys):
+        for k in keys:
+            self.store.pop(k, None)
+        return len(keys)
+
+    async def eval(self, script, numkeys, key, arg):
+        if self.store.get(key) == arg:
+            self.store.pop(key, None)
+            return 1
+        return 0
+
+
+@pytest.fixture
+def fake_redis():
+    return FakeRedis()
+
+
+@pytest.fixture(autouse=True)
+def _clear_memory_cache():
+    """The store's in-memory fallback is a module global; isolate every test."""
+    from cache.store import _memory_cache
+    _memory_cache._cache.clear()
+    _memory_cache._hits = 0
+    _memory_cache._misses = 0
+    yield
+    _memory_cache._cache.clear()

@@ -44,6 +44,22 @@ class CatalogIngestionService:
         logger.info("[ingest] artist deezer_id=%s '%s'", deezer_artist_id, dz.get("name"))
         return await self.artists.upsert_artist_graph({"artist": payload})
 
+    async def ingest_artist_profile(self, deezer_artist_id: int) -> Optional[str]:
+        """
+        Full artist page ingestion: the artist row plus its discography as
+        partial album rows (+credits) so the artist detail shows releases without
+        waiting for each album to be fully ingested. Album tracks are ingested
+        lazily when a release is opened.
+        """
+        artist_uuid = await self.ingest_artist(deezer_artist_id)
+        try:
+            albums = await self.deezer.get_artist_albums(deezer_artist_id, limit=100)
+            for a in (albums.get("data") or []):
+                await self.ingest_search_album(a)
+        except DeezerError as exc:
+            logger.warning("[ingest] artist %s discography failed: %s", deezer_artist_id, exc)
+        return artist_uuid
+
     # ── Album (complete graph) ──────────────────────────────────────────────
 
     async def ingest_album(self, deezer_album_id: int, *, complete: bool = True) -> Optional[str]:
