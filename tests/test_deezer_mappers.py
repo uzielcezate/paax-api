@@ -1,6 +1,6 @@
 """Deezer -> payload mapper unit tests."""
 
-from mappers.deezer_album_mapper import album_graph_payload
+from mappers.deezer_album_mapper import _album_artists, album_graph_payload
 from mappers.deezer_common import album_type, build_track_artists, slugify
 from mappers.deezer_track_mapper import parse_release, track_graph_payload
 
@@ -57,6 +57,60 @@ def test_track_graph_payload_partial_vs_full():
     assert len(p["track"]["artists"]) == 2
     assert p["album"]["metadata_status"] == "partial"
     assert p["album"]["release_date"] == "2024-04-05"
+
+
+# ── Phase 2.6: discography attribution ───────────────────────────────────────
+
+_CTX = {"deezer_id": 27, "name": "Daft Punk"}
+
+
+def test_album_artists_uses_parent_context_when_deezer_omits_artist():
+    # /artist/{id}/albums entry: no 'artist', no 'contributors' (the bug trigger).
+    aa = _album_artists({"id": 302, "title": "Discovery"}, _CTX)
+    assert aa == [{"deezer_id": 27, "name": "Daft Punk", "role": "primary", "position": 1}]
+
+
+def test_album_artists_preserves_explicit_and_does_not_duplicate_parent():
+    dz_album = {"id": 1, "artist": {"id": 27, "name": "Daft Punk"},
+                "contributors": [{"id": 27, "name": "Daft Punk", "role": "Main"}]}
+    aa = _album_artists(dz_album, _CTX)
+    assert [a["name"] for a in aa] == ["Daft Punk"]     # parent already present → no dupe
+    assert len(aa) == 1
+
+
+def test_album_artists_appends_parent_when_absent_from_explicit():
+    dz_album = {"id": 2, "artist": {"id": 999, "name": "Various Artists"}}
+    aa = _album_artists(dz_album, _CTX)
+    assert [(a["name"], a["position"]) for a in aa] == [
+        ("Various Artists", 1), ("Daft Punk", 2)]        # explicit preserved, parent appended
+
+
+def test_album_artists_no_placeholder_without_context():
+    assert _album_artists({"id": 3, "title": "Mystery"}, None) == []   # never "Unknown Artist"
+
+
+def test_album_artists_preserves_valid_collaborators():
+    dz_album = {"id": 4, "artist": {"id": 27, "name": "Daft Punk"},
+                "contributors": [{"id": 27, "name": "Daft Punk", "role": "Main"},
+                                 {"id": 55, "name": "Pharrell Williams", "role": "Featured"}]}
+    aa = _album_artists(dz_album, _CTX)
+    assert [a["name"] for a in aa] == ["Daft Punk", "Pharrell Williams"]
+    assert aa[1]["role"] == "featured"
+
+
+def test_album_graph_payload_partial_and_no_placeholder_without_artist():
+    p = album_graph_payload({"id": 3, "title": "Mystery", "nb_tracks": 1}, None,
+                            complete=False, metadata_status="full")
+    assert p["album_artists"] == []
+    assert p["album"]["metadata_status"] == "partial"   # downgraded (no attribution)
+
+
+def test_album_graph_payload_attributes_to_parent_context():
+    p = album_graph_payload({"id": 302, "title": "Discovery", "record_type": "album",
+                             "nb_tracks": 14}, None, complete=False,
+                            metadata_status="partial", artist_context=_CTX)
+    assert [a["deezer_id"] for a in p["album_artists"]] == [27]
+    assert not any(a["name"] == "Unknown Artist" for a in p["album_artists"])
 
 
 def test_album_graph_payload_uses_full_track_objs_for_credits():

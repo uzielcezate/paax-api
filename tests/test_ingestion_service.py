@@ -11,11 +11,12 @@ from tests.conftest import FakeGateway
 
 
 class FakeDeezer:
-    def __init__(self, album=None, tracks=None, artist=None, track_errors=None):
+    def __init__(self, album=None, tracks=None, artist=None, track_errors=None, artist_albums=None):
         self._album = album
         self._tracks = tracks or {}
         self._artist = artist
         self._track_errors = track_errors or {}
+        self._artist_albums = artist_albums or {"data": []}
         self.track_calls = []
 
     async def get_album(self, album_id):
@@ -29,6 +30,9 @@ class FakeDeezer:
 
     async def get_artist(self, artist_id):
         return self._artist
+
+    async def get_artist_albums(self, artist_id, limit=100):
+        return self._artist_albums
 
 
 def _rpc_returns():
@@ -121,3 +125,43 @@ async def test_ingest_track_propagates_deezer_not_found():
     svc, _ = _service(deezer)
     with pytest.raises(DeezerNotFound):
         await svc.ingest_track(999)
+
+
+# ── Phase 2.6: artist-profile discography attribution ────────────────────────
+
+# Deezer /artist/27/albums entries OMIT the nested 'artist' field (the bug).
+_DAFT_ARTIST = {"id": 27, "name": "Daft Punk", "nb_fan": 5000000}
+_DAFT_ALBUMS = {"data": [
+    {"id": 302, "title": "Discovery", "record_type": "album", "nb_tracks": 14},
+    {"id": 303, "title": "Homework", "record_type": "album", "nb_tracks": 16},
+]}
+
+
+def _album_payloads(gw):
+    return [p["p"] for name, p in gw.calls if name == "rpc:catalog_upsert_album_graph"]
+
+
+async def test_ingest_artist_profile_attributes_albums_to_parent():
+    deezer = FakeDeezer(artist=_DAFT_ARTIST, artist_albums=_DAFT_ALBUMS)
+    svc, gw = _service(deezer)
+
+    await svc.ingest_artist_profile(27)
+
+    payloads = _album_payloads(gw)
+    assert len(payloads) == 2
+    for p in payloads:
+        aa = p["album_artists"]
+        # Every album attributed to Daft Punk; NO null-deezer "Unknown Artist".
+        assert [a["deezer_id"] for a in aa] == [27]
+        assert all(a["name"] == "Daft Punk" for a in aa)
+        assert not any(a.get("deezer_id") is None for a in aa)
+
+
+async def test_ingest_artist_profile_is_idempotent_on_attribution():
+    deezer = FakeDeezer(artist=_DAFT_ARTIST, artist_albums=_DAFT_ALBUMS)
+    svc, gw = _service(deezer)
+    await svc.ingest_artist_profile(27)
+    await svc.ingest_artist_profile(27)   # second run
+    # Both runs emit identical attribution (no divergence / no placeholder).
+    for p in _album_payloads(gw):
+        assert [a["deezer_id"] for a in p["album_artists"]] == [27]
