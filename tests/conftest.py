@@ -65,6 +65,11 @@ class FakeGateway:
                 updated.append(copy.deepcopy(row))
         return updated
 
+    async def storage_upload(self, bucket, path, data, content_type, upsert=True):
+        self.calls.append(("storage_upload", {"bucket": bucket, "path": path,
+                                               "content_type": content_type, "bytes": len(data)}))
+        return f"https://storage.example/{bucket}/{path}"
+
 
 @pytest.fixture
 def catalog_tables() -> Dict[str, List[Dict[str, Any]]]:
@@ -176,6 +181,16 @@ class FakeRedis:
             self.store.pop(key, None)
             return 1
         return 0
+
+    async def incr(self, key):
+        self.store[key] = int(self.store.get(key, 0)) + 1
+        return self.store[key]
+
+    async def expire(self, key, seconds):
+        return True
+
+    async def ttl(self, key):
+        return 42
 
 
 @pytest.fixture

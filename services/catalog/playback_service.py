@@ -104,6 +104,15 @@ class PlaybackMatchingService:
                 scheduled += 1
         return scheduled
 
+    def schedule_ids(self, track_ids) -> int:
+        """Schedule background matching for specific track ids (non-blocking)."""
+        scheduled = 0
+        for tid in track_ids:
+            if tid:
+                self.jobs.schedule(lambda t=tid: self.resolve_and_persist(t), label=f"match:{t}")
+                scheduled += 1
+        return scheduled
+
     # ── internals ───────────────────────────────────────────────────────────
 
     def _build_meta(self, graph) -> Dict[str, Any]:

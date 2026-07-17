@@ -50,7 +50,7 @@ def _to_epoch(iso: Optional[str]) -> Optional[float]:
 
 class CatalogService:
     def __init__(self, *, redis, response_cache: ResponseCache, jobs,
-                 ingestion, artist_repo, album_repo, track_repo):
+                 ingestion, artist_repo, album_repo, track_repo, artwork=None):
         self.redis = redis
         self.cache = response_cache
         self.jobs = jobs
@@ -58,6 +58,7 @@ class CatalogService:
         self.artists = artist_repo
         self.albums = album_repo
         self.tracks = track_repo
+        self.artwork = artwork  # optional ArtworkService (Phase 2.5)
 
     # ── public API (Deezer-id entry points) ────────────────────────────────
 
@@ -93,6 +94,38 @@ class CatalogService:
             build=resp.track_response,
             ingest=lambda: self.ingestion.ingest_track(deezer_id),
         )
+
+    # ── internal-UUID entry points (entity must already exist) ─────────────
+
+    async def get_artist_by_internal_id(self, internal_id: str) -> Result:
+        return await self._get_by_internal(
+            "artist", CacheKeys.artist(internal_id), TTL.artist(),
+            lambda: self.artists.get_artist_by_id(internal_id), resp.artist_response,
+            lambda g: (lambda: self.ingestion.ingest_artist_profile(g.deezer_id)))
+
+    async def get_album_by_internal_id(self, internal_id: str) -> Result:
+        return await self._get_by_internal(
+            "album", CacheKeys.album(internal_id), TTL.album(),
+            lambda: self.albums.get_album_by_id(internal_id), resp.album_response,
+            lambda g: (lambda: self.ingestion.ingest_album(g.deezer_id, complete=True)))
+
+    async def get_track_by_internal_id(self, internal_id: str) -> Result:
+        return await self._get_by_internal(
+            "track", CacheKeys.track(internal_id), TTL.track(),
+            lambda: self.tracks.get_track_by_id(internal_id), resp.track_response,
+            lambda g: (lambda: self.ingestion.ingest_track(g.deezer_id)))
+
+    async def _get_by_internal(self, entity_type, cache_key, ttl, load, build,
+                               ingest_factory) -> Result:
+        env = await self.cache.get(cache_key)
+        if env is not None:
+            return env["data"], env["status"]
+        graph = await load()
+        if graph is None:
+            return None, CacheStatus.MISS
+        ingest = ingest_factory(graph) if graph.deezer_id is not None else (lambda: None)
+        return await self._serve_graph(graph, entity_type, cache_key, ttl, build, ingest,
+                                       deezer_id=graph.deezer_id)
 
     # ── generic cache-first + SWR + lock ───────────────────────────────────
 
@@ -138,14 +171,20 @@ class CatalogService:
                 graph = await load()
             if graph is None:
                 return None, CacheStatus.MISS
+            self._schedule_artwork(entity_type, graph)
             data = _dump(build(graph))
             await self.cache.set(cache_key, data, ttl, CacheStatus.HIT)
             return data, CacheStatus.MISS
         finally:
             await lock.release()
 
+    def _schedule_artwork(self, entity_type, graph) -> None:
+        if self.artwork is not None and entity_type in ("artist", "album"):
+            self.artwork.schedule_for_graph(entity_type, graph)
+
     async def _serve_graph(self, graph, entity_type, cache_key, ttl, build, ingest,
                            deezer_id) -> Result:
+        self._schedule_artwork(entity_type, graph)
         fresh = not is_stale(_to_epoch(getattr(graph, "metadata_updated_at", None)),
                              entity_type, time.time())
         if fresh:

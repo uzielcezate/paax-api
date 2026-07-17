@@ -130,6 +130,19 @@ class PostgrestGateway:
 
     # -- internals -----------------------------------------------------------
 
+    # -- storage -------------------------------------------------------------
+
+    async def storage_upload(self, bucket: str, path: str, data: bytes,
+                             content_type: str, upsert: bool = True) -> str:
+        """Upload bytes to a Storage bucket and return the public object URL."""
+        storage = self._client.storage.from_(bucket)
+        await storage.upload(
+            path, data,
+            {"content-type": content_type, "upsert": "true" if upsert else "false"},
+        )
+        base = settings.supabase_url.rstrip("/")
+        return f"{base}/storage/v1/object/public/{bucket}/{path}"
+
     async def _execute(self, build_query):
         """Run ``build_query().execute()`` with a small transient-retry loop."""
         last_exc: Optional[Exception] = None
