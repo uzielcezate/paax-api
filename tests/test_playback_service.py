@@ -121,6 +121,17 @@ async def test_report_failure_gives_up_at_threshold():
     assert called["n"] == 0            # no re-resolve after giving up
 
 
+async def test_schedule_ids_does_not_raise_and_counts():
+    # Regression: schedule_ids used an out-of-scope `t` in its log label
+    # (f"match:{t}"), raising NameError before any job was scheduled — which
+    # made /v2/albums/deezer/{id} and /v2/artists/{id}/top return 500.
+    gw = FakeGateway(_track_tables())
+    result = MatchResult(None, None, None, YoutubeMatchStatus.FAILED)
+    svc = _service(gw, result)
+    n = svc.schedule_ids(["trk-1", "trk-2", None])
+    assert n == 2                      # None skipped; must not raise NameError
+
+
 async def test_missing_match_does_not_break_metadata():
     gw = FakeGateway(_track_tables())
     result = MatchResult(None, None, None, YoutubeMatchStatus.FAILED)
