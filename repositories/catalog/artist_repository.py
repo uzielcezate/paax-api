@@ -26,6 +26,10 @@ class ArtistRepository(CatalogRepositoryBase):
 
     get_artist_with_releases = get_artist_by_id
 
+    async def upsert_artist_graph(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Atomic artist-graph upsert (artist + genres)."""
+        return await self._upsert_graph("catalog_upsert_artist_graph", payload)
+
     async def load_releases(self, artist_id: str) -> List[ReleaseSummary]:
         """All albums crediting this artist, newest release first."""
         aa_rows = await self.g.fetch_all("album_artists", [("artist_id", "eq", artist_id)])

@@ -48,6 +48,10 @@ class TrackRepository(CatalogRepositoryBase):
         """Raw row (used by the matcher, which needs canonical metadata + state)."""
         return await self._row_by_id(track_id)
 
+    async def upsert_track_graph(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Atomic track-graph upsert (preserves youtube_* + cached artwork)."""
+        return await self._upsert_graph("catalog_upsert_track_graph", payload)
+
     async def update_youtube_match(self, track_id: str, values: Dict[str, Any]) -> None:
         """
         Persist a YouTube match. Only whitelisted youtube_* columns are written,

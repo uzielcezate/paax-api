@@ -33,6 +33,13 @@ class CatalogRepositoryBase:
         row = await self.g.fetch_one(self.table, [("deezer_id", "eq", deezer_id)], columns="id")
         return row is not None
 
+    async def _upsert_graph(self, rpc_name: str, payload: dict) -> Optional[str]:
+        """Call an atomic graph-upsert RPC and return the entity uuid."""
+        result = await self.g.rpc(rpc_name, {"p": payload})
+        if isinstance(result, list):
+            return result[0] if result else None
+        return result
+
     # -- metadata state transitions -----------------------------------------
 
     async def mark_metadata_failed(self, entity_id: str) -> None:

@@ -22,6 +22,10 @@ class AlbumRepository(CatalogRepositoryBase):
     # get_album_with_tracks is the canonical full read.
     get_album_with_tracks = get_album_by_id
 
+    async def upsert_album_graph(self, payload: Dict[str, Any]) -> Optional[str]:
+        """Atomic album-graph upsert (artists, album, tracks, credits, genres)."""
+        return await self._upsert_graph("catalog_upsert_album_graph", payload)
+
     async def _graph(self, album_row: Optional[Dict[str, Any]]) -> Optional[AlbumGraph]:
         if not album_row:
             return None
