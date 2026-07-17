@@ -5,3 +5,7 @@ python-multipart==0.0.9
 redis==5.0.8
 httpx==0.27.0
 yt-dlp>=2024.1.0
+
+# ── Phase 2: Supabase-first catalog ───────────────────────────────────────────
+supabase>=2.9,<3        # async client for the persistent catalog (service-role, backend-only)
+Pillow>=10.3,<12        # artwork WebP conversion (Phase 2.5)
