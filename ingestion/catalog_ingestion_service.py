@@ -50,12 +50,24 @@ class CatalogIngestionService:
         partial album rows (+credits) so the artist detail shows releases without
         waiting for each album to be fully ingested. Album tracks are ingested
         lazily when a release is opened.
+
+        Deezer's ``/artist/{id}/albums`` entries frequently omit the nested
+        ``artist`` field, so the authoritative parent-artist context (deezer_id +
+        canonical name) is injected into each album graph. This guarantees the
+        album is attributed to this artist and prevents "Unknown Artist"
+        placeholder rows (Phase 2.6).
         """
-        artist_uuid = await self.ingest_artist(deezer_artist_id)
+        dz_artist = await self.deezer.get_artist(deezer_artist_id)
+        artist_uuid = await self.artists.upsert_artist_graph(
+            {"artist": artist_payload(dz_artist, metadata_status="full", complete=False)})
+        logger.info("[ingest] artist deezer_id=%s '%s'", deezer_artist_id, dz_artist.get("name"))
+
+        artist_context = {"deezer_id": deezer_artist_id, "name": dz_artist.get("name"),
+                          "internal_id": artist_uuid}
         try:
             albums = await self.deezer.get_artist_albums(deezer_artist_id, limit=100)
             for a in (albums.get("data") or []):
-                await self.ingest_search_album(a)
+                await self.ingest_search_album(a, artist_context=artist_context)
         except DeezerError as exc:
             logger.warning("[ingest] artist %s discography failed: %s", deezer_artist_id, exc)
         return artist_uuid
@@ -109,8 +121,10 @@ class CatalogIngestionService:
         payload = track_graph_payload(dz_track, metadata_status="partial", complete=False)
         return await self.tracks.upsert_track_graph(payload)
 
-    async def ingest_search_album(self, dz_album: Dict[str, Any]) -> Optional[str]:
-        payload = album_graph_payload(dz_album, None, complete=False, metadata_status="partial")
+    async def ingest_search_album(self, dz_album: Dict[str, Any],
+                                  artist_context: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        payload = album_graph_payload(dz_album, None, complete=False,
+                                      metadata_status="partial", artist_context=artist_context)
         return await self.albums.upsert_album_graph(payload)
 
     async def ingest_search_artist(self, dz_artist: Dict[str, Any]) -> Optional[str]:
