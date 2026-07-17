@@ -32,6 +32,11 @@ import asyncio
 import datetime
 from cache import get_redis_client, make_cache_key, cache_get, cache_set, get_memory_cache_stats
 
+# ── Phase 2.5: normalized catalog API, container, observability ───────────────
+from observability import setup_logging, new_request_id
+from app_container import container
+from api.v2_catalog_router import router as v2_catalog_router
+
 # ── Hybrid Deezer + YouTube services ──────────────────────────────────────────
 from services.deezer.deezer_client import DeezerClient
 from services.youtube.youtube_cache import init_cache as init_yt_cache
@@ -107,6 +112,14 @@ async def lifespan(app: FastAPI):
     init_yt_cache(redis_client)
     print("[paax-api] YouTube match cache initialized OK")
 
+    # Phase 2 service container (Supabase-first catalog). Degrades gracefully if
+    # Supabase is not configured (legacy endpoints keep working).
+    setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
+    try:
+        await container.startup(redis=redis_client, deezer=deezer_client)
+    except Exception as e:
+        print(f"[paax-api] container startup error: {e}")
+
     yield  # App runs here
 
     # Cleanup
@@ -159,6 +172,19 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def correlation_id_middleware(request, call_next):
+    """Attach a request-correlation id to logs + the X-Request-ID response header."""
+    rid = new_request_id(request.headers.get("X-Request-ID"))
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
+# Normalized Supabase-first catalog endpoints (additive; legacy /v2 untouched).
+app.include_router(v2_catalog_router)
+
+
 # ---------------------------------------------------------------------------
 # Health / status
 # ---------------------------------------------------------------------------
@@ -173,9 +199,46 @@ def read_root():
 
 
 @app.get("/health")
-def health():
-    """Railway / uptime health check."""
-    return {"ok": True, "authenticated": _is_authenticated}
+async def health():
+    """
+    Railway / uptime health check with dependency status.
+
+    Reports healthy | degraded | unavailable without exposing any secret or raw
+    connection string. Always returns HTTP 200 (the app process is up); the
+    `status` field differentiates degraded/unavailable.
+    """
+    # Redis
+    redis_state = "not_configured"
+    if redis_client is not None:
+        try:
+            await redis_client.ping()
+            redis_state = "healthy"
+        except Exception:
+            redis_state = "unavailable"
+
+    # Supabase (readiness flag only — no per-health network round-trip)
+    supabase_state = "healthy" if container.supabase_ready else "unavailable"
+
+    deps = {
+        "supabase": supabase_state,
+        "redis": redis_state,
+        "deezer": "configured" if deezer_client is not None else "unavailable",
+        "matcher": "available" if container.matcher_available else "unavailable",
+    }
+
+    if supabase_state != "healthy":
+        overall = "degraded"          # legacy endpoints still serve; catalog off
+    elif redis_state == "unavailable":
+        overall = "degraded"          # cache/locks off but functional
+    else:
+        overall = "healthy"
+
+    return {
+        "ok": True,
+        "status": overall,
+        "authenticated": _is_authenticated,
+        "dependencies": deps,
+    }
 
 
 @app.get("/cache/status")
