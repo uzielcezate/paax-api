@@ -87,6 +87,10 @@ class FreshnessPolicy:
 class Limits:
     max_deezer_concurrency: int = _env_int("MAX_DEEZER_CONCURRENCY", 5)
     max_youtube_match_concurrency: int = _env_int("MAX_YOUTUBE_MATCH_CONCURRENCY", 3)
+    # Bounded fan-out for the partial-album discography upserts during artist
+    # ingestion. Replaces the old serial loop that dominated first-open latency
+    # for uncached artists (Phase 3.3 §3).
+    max_discography_concurrency: int = _env_int("MAX_DISCOGRAPHY_CONCURRENCY", 8)
     artwork_max_bytes: int = _env_int("ARTWORK_MAX_BYTES", 5 * 1024 * 1024)       # 5 MiB
     artwork_download_timeout: int = _env_int("ARTWORK_DOWNLOAD_TIMEOUT_SECONDS", 10)
     lock_wait_seconds: int = _env_int("INGEST_LOCK_WAIT_SECONDS", 8)

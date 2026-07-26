@@ -1,5 +1,7 @@
 """Ingestion service tests (per-track detail fetch, credit preservation, errors)."""
 
+import asyncio
+
 import pytest
 
 from ingestion.catalog_ingestion_service import CatalogIngestionService
@@ -165,3 +167,47 @@ async def test_ingest_artist_profile_is_idempotent_on_attribution():
     # Both runs emit identical attribution (no divergence / no placeholder).
     for p in _album_payloads(gw):
         assert [a["deezer_id"] for a in p["album_artists"]] == [27]
+
+
+# ── Phase 3.3 §3: bounded-concurrency discography fan-out ─────────────────────
+
+class _ConcurrencyProbeGateway(FakeGateway):
+    """Records the peak number of concurrent album-graph upserts in flight."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._in_flight = 0
+        self.peak = 0
+
+    async def rpc(self, fn, params):
+        if fn == "catalog_upsert_album_graph":
+            self._in_flight += 1
+            self.peak = max(self.peak, self._in_flight)
+            await asyncio.sleep(0.01)  # hold the slot so overlap is observable
+            try:
+                return await super().rpc(fn, params)
+            finally:
+                self._in_flight -= 1
+        return await super().rpc(fn, params)
+
+
+async def test_ingest_artist_profile_bounds_discography_concurrency():
+    many = {"data": [
+        {"id": 1000 + i, "title": f"Album {i}", "record_type": "album", "nb_tracks": 10}
+        for i in range(30)
+    ]}
+    deezer = FakeDeezer(artist=_DAFT_ARTIST, artist_albums=many)
+    gw = _ConcurrencyProbeGateway({}, rpc_returns=_rpc_returns())
+    svc = CatalogIngestionService(
+        deezer, ArtistRepository(gw), AlbumRepository(gw), TrackRepository(gw),
+        discography_concurrency=4,
+    )
+
+    await svc.ingest_artist_profile(27)
+
+    # All 30 albums ingested…
+    assert len(_album_payloads(gw)) == 30
+    # …but never more than the configured bound concurrently, and it did fan out
+    # beyond a serial loop (peak > 1).
+    assert gw.peak <= 4
+    assert gw.peak > 1

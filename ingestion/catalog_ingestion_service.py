@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from config import settings
 from mappers.deezer_album_mapper import album_graph_payload
 from mappers.deezer_artist_mapper import artist_payload
 from mappers.deezer_track_mapper import track_graph_payload
@@ -29,12 +31,18 @@ logger = logging.getLogger("paax.ingest")
 
 class CatalogIngestionService:
     def __init__(self, deezer, artist_repo, album_repo, track_repo,
-                 *, fetch_track_details: bool = True):
+                 *, fetch_track_details: bool = True,
+                 discography_concurrency: Optional[int] = None):
         self.deezer = deezer
         self.artists = artist_repo
         self.albums = album_repo
         self.tracks = track_repo
         self.fetch_track_details = fetch_track_details
+        self.discography_concurrency = max(
+            1, discography_concurrency
+            if discography_concurrency is not None
+            else settings.limits.max_discography_concurrency,
+        )
 
     # ── Artist ──────────────────────────────────────────────────────────────
 
@@ -57,19 +65,44 @@ class CatalogIngestionService:
         album is attributed to this artist and prevents "Unknown Artist"
         placeholder rows (Phase 2.6).
         """
+        started = time.monotonic()
         dz_artist = await self.deezer.get_artist(deezer_artist_id)
         artist_uuid = await self.artists.upsert_artist_graph(
             {"artist": artist_payload(dz_artist, metadata_status="full", complete=False)})
-        logger.info("[ingest] artist deezer_id=%s '%s'", deezer_artist_id, dz_artist.get("name"))
+        core_ms = int((time.monotonic() - started) * 1000)
 
         artist_context = {"deezer_id": deezer_artist_id, "name": dz_artist.get("name"),
                           "internal_id": artist_uuid}
+        ingested = 0
+        album_items: List[Dict[str, Any]] = []
         try:
             albums = await self.deezer.get_artist_albums(deezer_artist_id, limit=100)
-            for a in (albums.get("data") or []):
-                await self.ingest_search_album(a, artist_context=artist_context)
+            album_items = albums.get("data") or []
+            # Bounded-concurrency fan-out: the old serial loop of up to 100
+            # partial-album upserts dominated uncached-artist first-open latency
+            # (Phase 3.3 §3). Each item is independent and idempotent.
+            sem = asyncio.Semaphore(self.discography_concurrency)
+
+            async def _one(a: Dict[str, Any]) -> Optional[str]:
+                async with sem:
+                    return await self.ingest_search_album(a, artist_context=artist_context)
+
+            results = await asyncio.gather(*[_one(a) for a in album_items],
+                                           return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    logger.warning("[ingest] artist %s album upsert failed: %s",
+                                   deezer_artist_id, r)
+                elif r:
+                    ingested += 1
         except DeezerError as exc:
             logger.warning("[ingest] artist %s discography failed: %s", deezer_artist_id, exc)
+        total_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "[ingest] artist deezer_id=%s '%s' core=%dms total=%dms discography=%d/%d conc=%d",
+            deezer_artist_id, dz_artist.get("name"), core_ms, total_ms,
+            ingested, len(album_items), self.discography_concurrency,
+        )
         return artist_uuid
 
     # ── Album (complete graph) ──────────────────────────────────────────────
