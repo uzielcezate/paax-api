@@ -146,6 +146,7 @@ def release_summary(album_row: Dict[str, Any]) -> ReleaseSummary:
         title=album_row.get("title") or "Unknown Album",
         album_type=album_row.get("album_type") or "album",
         release_date=_iso(album_row.get("release_date")),
+        release_year=album_row.get("release_year"),
         cover_original_url=album_row.get("cover_original_url"),
         cover_cached_url=album_row.get("cover_cached_url"),
         total_tracks=album_row.get("total_tracks"),
