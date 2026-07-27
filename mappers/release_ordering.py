@@ -36,11 +36,18 @@ def _effective_ymd(r: ReleaseSummary) -> Tuple[int, int, int]:
     return (0, 0, 0)
 
 
+def _has_exact_date(r: ReleaseSummary) -> bool:
+    """True only when release_date actually parses as a date (not garbage)."""
+    s = r.release_date
+    return bool(s and len(s) >= 4 and s[:4].isdigit())
+
+
 def _recency_key(r: ReleaseSummary) -> Tuple[int, int, int, int]:
     year, month, day = _effective_ymd(r)
     # Within an identical (y, m, d), an exactly-dated release ranks above a
-    # year-only one (exact=1 > 0 under the reverse=True recency sort).
-    return (year, month, day, 1 if r.release_date else 0)
+    # year-only one (exact=1 > 0 under the reverse=True recency sort). A
+    # non-parseable release_date is NOT treated as exact.
+    return (year, month, day, 1 if _has_exact_date(r) else 0)
 
 
 def sort_releases(releases: List[ReleaseSummary]) -> List[ReleaseSummary]:
