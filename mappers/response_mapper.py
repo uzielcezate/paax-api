@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from mappers.release_ordering import sort_releases
 from schemas.catalog.album import AlbumGraph, AlbumResponse
 from schemas.catalog.artist import (
     ArtistGraph,
@@ -127,6 +128,7 @@ def _release_response(r: ReleaseSummary) -> ReleaseResponse:
         title=r.title,
         album_type=r.album_type,
         release_date=r.release_date,
+        release_year=r.release_year,
         cover_url=r.cover_url,
         total_tracks=r.total_tracks,
         explicit=r.explicit,
@@ -135,7 +137,9 @@ def _release_response(r: ReleaseSummary) -> ReleaseResponse:
 
 def _discography(releases: List[ReleaseSummary]) -> DiscographySections:
     sections = DiscographySections()
-    for r in releases:  # releases arrive newest-first; preserve order per section
+    # Defensive re-sort: the repository already returns releases newest-first,
+    # but this guarantees malformed upstream ordering never leaks per category.
+    for r in sort_releases(list(releases)):
         resp = _release_response(r)
         t = r.album_type
         if t == AlbumType.SINGLE:
@@ -150,12 +154,18 @@ def _discography(releases: List[ReleaseSummary]) -> DiscographySections:
 
 
 def artist_response(g: ArtistGraph, *, metadata_override: Optional[str] = None) -> ArtistResponse:
-    # Latest release = newest *dated* release (releases are pre-sorted newest-first).
+    # Latest release (Phase 3.3 §4): the most recently released record of ANY
+    # eligible type. Prefer the newest exactly-dated release (release_date DESC
+    # NULLS LAST); fall back to the newest release overall only when none of the
+    # artist's releases carry an exact date.
+    ordered = sort_releases(list(g.releases))
     latest = None
-    for r in g.releases:
+    for r in ordered:
         if r.release_date:
             latest = _release_response(r)
             break
+    if latest is None and ordered:
+        latest = _release_response(ordered[0])
     return ArtistResponse(
         id=g.id,
         deezer_id=g.deezer_id,

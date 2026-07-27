@@ -20,6 +20,7 @@ class ReleaseSummary(BaseModel):
     title: str
     album_type: str = "album"
     release_date: Optional[str] = None
+    release_year: Optional[int] = None
     cover_original_url: Optional[str] = None
     cover_cached_url: Optional[str] = None
     total_tracks: Optional[int] = None
@@ -70,6 +71,7 @@ class ReleaseResponse(CamelModel):
     title: str
     album_type: str = "album"
     release_date: Optional[str] = None
+    release_year: Optional[int] = None
     cover_url: Optional[str] = None
     total_tracks: Optional[int] = None
     explicit: bool = False

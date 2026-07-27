@@ -5,14 +5,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from mappers import row_mappers as rm
+from mappers.release_ordering import sort_releases
 from schemas.catalog.artist import ArtistGraph, ReleaseSummary
 
 from repositories.catalog.base import CatalogRepositoryBase
-
-
-def _release_sort_key(r: ReleaseSummary):
-    # Newest first; releases without a date sort last.
-    return (r.release_date or "", )
 
 
 class ArtistRepository(CatalogRepositoryBase):
@@ -38,8 +34,7 @@ class ArtistRepository(CatalogRepositoryBase):
             return []
         album_rows = await self.g.fetch_all("albums", [("id", "in", album_ids)])
         releases = [rm.release_summary(a) for a in album_rows]
-        releases.sort(key=_release_sort_key, reverse=True)
-        return releases
+        return sort_releases(releases)
 
     async def _graph(self, artist_row: Optional[Dict[str, Any]]) -> Optional[ArtistGraph]:
         if not artist_row:
