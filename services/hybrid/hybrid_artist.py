@@ -3,6 +3,7 @@ Hybrid artist service: Deezer artist profile + YouTube video IDs for top tracks.
 """
 
 import asyncio
+import os
 from typing import Dict, Any, List
 
 from ..deezer.deezer_client import DeezerClient
@@ -11,6 +12,19 @@ from ..youtube.youtube_matcher import match_track
 
 # Limit concurrent YouTube searches
 _YT_SEMAPHORE = asyncio.Semaphore(3)
+
+# Phase 3.3.1 §2: the artist page shows only a handful of "Popular" tracks, but
+# this endpoint used to eagerly YouTube-match up to 50 (semaphore 3, 30s each),
+# which dominated cold-artist latency. Match a bounded head of the top list and
+# use a tighter per-track timeout; the rest can be matched on demand later.
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+_TOP_MATCH_LIMIT = _int_env("HYBRID_ARTIST_TOP_MATCH_LIMIT", 15)
+_TOP_MATCH_TIMEOUT = _int_env("HYBRID_ARTIST_TOP_MATCH_TIMEOUT_SECONDS", 12)
 
 
 async def get_hybrid_artist(
@@ -24,7 +38,7 @@ async def get_hybrid_artist(
     """
     # ── Parallel Deezer fetches ───────────────────────────────────────────
     artist_fut = deezer.get_artist(artist_id)
-    top_fut = deezer.get_artist_top(artist_id, limit=50)
+    top_fut = deezer.get_artist_top(artist_id, limit=max(_TOP_MATCH_LIMIT, 1))
     albums_fut = deezer.get_artist_albums(artist_id, limit=100)
     related_fut = deezer.get_artist_related(artist_id)
 
@@ -37,6 +51,10 @@ async def get_hybrid_artist(
     if isinstance(artist_raw, Exception):
         raise artist_raw
     top_tracks_data = top_raw.get("data", []) if not isinstance(top_raw, Exception) else []
+    # Only YouTube-match a bounded head (the artist page shows a handful of
+    # "Popular" tracks). Slicing here caps the eager-match fan-out regardless of
+    # how many Deezer returned (Phase 3.3.1 §2 / review L2).
+    top_tracks_data = top_tracks_data[:_TOP_MATCH_LIMIT]
     albums_data = albums_raw.get("data", []) if not isinstance(albums_raw, Exception) else []
     related_data = related_raw.get("data", []) if not isinstance(related_raw, Exception) else []
 
@@ -55,7 +73,7 @@ async def get_hybrid_artist(
             async with _YT_SEMAPHORE:
                 playback = await asyncio.wait_for(
                     match_track(artist_name, title, album_title, duration, explicit),
-                    timeout=30.0,
+                    timeout=float(_TOP_MATCH_TIMEOUT),
                 )
         except asyncio.TimeoutError:
             playback = {
