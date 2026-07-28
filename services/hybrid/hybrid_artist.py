@@ -38,7 +38,7 @@ async def get_hybrid_artist(
     """
     # ── Parallel Deezer fetches ───────────────────────────────────────────
     artist_fut = deezer.get_artist(artist_id)
-    top_fut = deezer.get_artist_top(artist_id, limit=max(_TOP_MATCH_LIMIT, 15))
+    top_fut = deezer.get_artist_top(artist_id, limit=max(_TOP_MATCH_LIMIT, 1))
     albums_fut = deezer.get_artist_albums(artist_id, limit=100)
     related_fut = deezer.get_artist_related(artist_id)
 
@@ -51,6 +51,10 @@ async def get_hybrid_artist(
     if isinstance(artist_raw, Exception):
         raise artist_raw
     top_tracks_data = top_raw.get("data", []) if not isinstance(top_raw, Exception) else []
+    # Only YouTube-match a bounded head (the artist page shows a handful of
+    # "Popular" tracks). Slicing here caps the eager-match fan-out regardless of
+    # how many Deezer returned (Phase 3.3.1 §2 / review L2).
+    top_tracks_data = top_tracks_data[:_TOP_MATCH_LIMIT]
     albums_data = albums_raw.get("data", []) if not isinstance(albums_raw, Exception) else []
     related_data = related_raw.get("data", []) if not isinstance(related_raw, Exception) else []
 
