@@ -114,6 +114,24 @@ class Settings:
     # Redis (optional — caching degrades gracefully when absent)
     redis_url: str = _env_str("REDIS_URL")
 
+    # Public API key — used ONLY to exchange a freshly minted demo identity's
+    # one-time password for a session (GoTrue password grant). Public values.
+    # Preferred: the modern `sb_publishable_...` key (opaque string, NOT a JWT —
+    # it is only ever sent as the `apikey` header, never decoded or verified).
+    # Fallback: the legacy anon JWT, kept for backward compatibility.
+    supabase_publishable_key: str = _env_str("SUPABASE_PUBLISHABLE_KEY")
+    supabase_anon_key: str = _env_str("SUPABASE_ANON_KEY")
+
+    # Portfolio demo sessions (see docs/features/demo-mode.md)
+    demo_enabled: bool = _env_bool("DEMO_ENABLED", True)
+    demo_session_seconds: int = _env_int("DEMO_SESSION_SECONDS", 600)
+    demo_rate_limit_per_ip: int = _env_int("DEMO_RATE_LIMIT_PER_IP", 6)
+    demo_rate_limit_window: int = _env_int("DEMO_RATE_LIMIT_WINDOW_SECONDS", 600)
+    demo_rate_limit_global: int = _env_int("DEMO_RATE_LIMIT_GLOBAL", 120)
+    demo_email_domain: str = _env_str("DEMO_EMAIL_DOMAIN", "demo.paaxmusic.app")
+    demo_display_name: str = _env_str("DEMO_DISPLAY_NAME", "Demo Visitor")
+    demo_web_url: str = _env_str("DEMO_WEB_URL", "https://paaxmusic.app/?demo=1")
+
     # Feature toggles
     supabase_enabled: bool = _env_bool("SUPABASE_ENABLED", True)
     artwork_caching_enabled: bool = _env_bool("ARTWORK_CACHING_ENABLED", True)
@@ -121,6 +139,25 @@ class Settings:
     ttl: TTLPolicy = field(default_factory=TTLPolicy)
     freshness: FreshnessPolicy = field(default_factory=FreshnessPolicy)
     limits: Limits = field(default_factory=Limits)
+
+    @property
+    def supabase_public_api_key(self) -> str:
+        """Public key for the GoTrue password grant: publishable first, legacy anon second."""
+        return self.supabase_publishable_key or self.supabase_anon_key
+
+    @property
+    def supabase_public_api_key_kind(self) -> str:
+        """'publishable' | 'anon' | 'none' — safe to log (never the value itself)."""
+        if self.supabase_publishable_key:
+            return "publishable"
+        if self.supabase_anon_key:
+            return "anon"
+        return "none"
+
+    @property
+    def demo_configured(self) -> bool:
+        """Demo sessions need Supabase (service role) AND a public API key."""
+        return self.demo_enabled and self.supabase_configured and bool(self.supabase_public_api_key)
 
     @property
     def supabase_configured(self) -> bool:

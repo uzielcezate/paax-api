@@ -34,6 +34,9 @@ class FakeGateway:
             elif op == "is":
                 if cell is not val:
                     return False
+            elif op == "lt":
+                if cell is None or not (cell < val):
+                    return False
             else:
                 raise AssertionError(f"FakeGateway: unsupported op {op}")
         return True
@@ -64,6 +67,17 @@ class FakeGateway:
                 row.update(values)
                 updated.append(copy.deepcopy(row))
         return updated
+
+    async def insert(self, table, values):
+        self.calls.append((f"insert:{table}", values))
+        self._tables.setdefault(table, []).append(copy.deepcopy(values))
+        return [copy.deepcopy(values)]
+
+    async def delete(self, table, filters):
+        rows = self._tables.get(table, [])
+        gone = [r for r in rows if self._match(r, filters)]
+        self._tables[table] = [r for r in rows if r not in gone]
+        return gone
 
     async def storage_upload(self, bucket, path, data, content_type, upsert=True):
         self.calls.append(("storage_upload", {"bucket": bucket, "path": path,

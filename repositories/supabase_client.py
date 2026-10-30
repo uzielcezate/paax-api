@@ -59,6 +59,12 @@ class SupabaseGateway(Protocol):
     ) -> List[Dict[str, Any]]:
         ...
 
+    async def insert(self, table: str, values: Dict[str, Any]) -> List[Dict[str, Any]]:
+        ...
+
+    async def delete(self, table: str, filters: Sequence[Filter]) -> List[Dict[str, Any]]:
+        ...
+
 
 class SupabaseUnavailable(RuntimeError):
     """Raised when a Supabase operation is attempted but no client is configured."""
@@ -127,6 +133,32 @@ class PostgrestGateway:
 
         resp = await self._execute(_build)
         return list(resp.data or [])
+
+    async def insert(self, table, values):
+        resp = await self._execute(lambda: self._client.table(table).insert(values))
+        return list(resp.data or [])
+
+    async def delete(self, table, filters):
+        def _build():
+            q = self._client.table(table).delete()
+            for col, op, val in filters:
+                if op == "eq":
+                    q = q.eq(col, val)
+                elif op == "lt":
+                    q = q.lt(col, val)
+                else:
+                    raise ValueError(f"delete supports only eq/lt filters, got {op}")
+            return q
+
+        resp = await self._execute(_build)
+        return list(resp.data or [])
+
+    # -- auth admin (service role) -------------------------------------------
+
+    @property
+    def auth_admin(self):
+        """GoTrue admin API (create/delete users). Service-role only."""
+        return self._client.auth.admin
 
     # -- internals -----------------------------------------------------------
 

@@ -36,6 +36,7 @@ from cache import get_redis_client, make_cache_key, cache_get, cache_set, get_me
 from observability import setup_logging, new_request_id
 from app_container import container
 from api.v2_catalog_router import router as v2_catalog_router
+from api.demo_router import router as demo_router
 
 # ── Hybrid Deezer + YouTube services ──────────────────────────────────────────
 from services.deezer.deezer_client import DeezerClient
@@ -160,12 +161,22 @@ _local_origins_regex = (
 _extra_origins_raw = os.environ.get("FRONTEND_ORIGINS", "")
 _extra_origins     = [o.strip() for o in _extra_origins_raw.split(",") if o.strip()]
 
-print(f"[CORS] LAN regex active. Extra origins: {_extra_origins or '(none)'}")
+# Optional extra origin PATTERN (additive): e.g. Cloudflare Pages preview deployments
+# (`https://<hash>.<project>.pages.dev`) cannot be enumerated in FRONTEND_ORIGINS.
+# Example: FRONTEND_ORIGIN_REGEX=https://[a-z0-9-]+\.paax-demo\.pages\.dev
+_extra_origin_regex = os.environ.get("FRONTEND_ORIGIN_REGEX", "").strip()
+_allow_origin_regex = (
+    f"^(?:{_local_origins_regex}|{_extra_origin_regex})$" if _extra_origin_regex
+    else f"^{_local_origins_regex}$"
+)
+
+print(f"[CORS] LAN regex active. Extra origins: {_extra_origins or '(none)'}; "
+      f"extra regex: {_extra_origin_regex or '(none)'}")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_extra_origins,
-    allow_origin_regex=_local_origins_regex,
+    allow_origin_regex=_allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -183,6 +194,7 @@ async def correlation_id_middleware(request, call_next):
 
 # Normalized Supabase-first catalog endpoints (additive; legacy /v2 untouched).
 app.include_router(v2_catalog_router)
+app.include_router(demo_router)
 
 
 # ---------------------------------------------------------------------------
