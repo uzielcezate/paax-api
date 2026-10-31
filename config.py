@@ -123,7 +123,9 @@ class Settings:
     supabase_anon_key: str = _env_str("SUPABASE_ANON_KEY")
 
     # Portfolio demo sessions (see docs/features/demo-mode.md)
-    demo_enabled: bool = _env_bool("DEMO_ENABLED", True)
+    # Off by default: production must opt in explicitly (DEMO_ENABLED=true)
+    # only after the Supabase migration and the origin checks have passed.
+    demo_enabled: bool = _env_bool("DEMO_ENABLED", False)
     demo_session_seconds: int = _env_int("DEMO_SESSION_SECONDS", 600)
     demo_rate_limit_per_ip: int = _env_int("DEMO_RATE_LIMIT_PER_IP", 6)
     demo_rate_limit_window: int = _env_int("DEMO_RATE_LIMIT_WINDOW_SECONDS", 600)

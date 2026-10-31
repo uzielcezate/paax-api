@@ -339,3 +339,13 @@ def test_gotrue_http_sends_key_as_opaque_apikey_header_and_rejects_secret():
     assert c._base == "https://x.supabase.co/auth/v1"
     with pytest.raises(ValueError):
         GoTrueHttp("https://x.supabase.co", "sb_secret_nope")
+
+
+def test_demo_is_disabled_by_default_when_env_unset(monkeypatch):
+    """Production safety: with DEMO_ENABLED unset the feature is off and the router answers 503."""
+    import importlib
+    import config
+    monkeypatch.delenv("DEMO_ENABLED", raising=False)
+    fresh = importlib.reload(config).Settings()
+    assert fresh.demo_enabled is False
+    assert fresh.demo_configured is False
