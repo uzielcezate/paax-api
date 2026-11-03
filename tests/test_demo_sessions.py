@@ -349,3 +349,31 @@ def test_demo_is_disabled_by_default_when_env_unset(monkeypatch):
     fresh = importlib.reload(config).Settings()
     assert fresh.demo_enabled is False
     assert fresh.demo_configured is False
+
+
+def test_client_ip_prefers_cloudflare_header_and_rightmost_forwarded_hop():
+    """Production topology is client -> Cloudflare -> Railway edge -> app. A caller must not be
+    able to pick its own rate-limit bucket by sending X-Forwarded-For itself."""
+    from api.demo_router import client_ip
+
+    class _Req:
+        def __init__(self, headers, peer="10.9.9.9"):
+            self.headers = headers
+            self.client = type("C", (), {"host": peer})()
+
+    assert client_ip(_Req({"cf-connecting-ip": "198.51.100.7",
+                           "x-forwarded-for": "1.1.1.1, 198.51.100.7"})) == "198.51.100.7"
+    # spoofed first hop + real client appended by the edge -> the edge's entry wins
+    assert client_ip(_Req({"x-forwarded-for": "1.1.1.1, 203.0.113.9"})) == "203.0.113.9"
+    assert client_ip(_Req({"x-forwarded-for": " 203.0.113.9 "})) == "203.0.113.9"
+    assert client_ip(_Req({})) == "10.9.9.9"
+
+
+def test_router_rate_limit_cannot_be_evaded_by_spoofing_first_forwarded_hop(demo_client):
+    client, c = demo_client
+    # Same real client (rightmost hop) rotating a fake first hop on every call
+    for i in range(2):
+        assert client.post("/v2/demo/sessions",
+                           headers={"X-Forwarded-For": f"10.0.0.{i}, 203.0.113.9"}).status_code == 201
+    r = client.post("/v2/demo/sessions", headers={"X-Forwarded-For": "10.0.0.99, 203.0.113.9"})
+    assert r.status_code == 429

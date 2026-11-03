@@ -42,12 +42,26 @@ def _service():
 
 
 def client_ip(request: Request) -> str:
-    """First X-Forwarded-For hop (Railway/Cloudflare proxy) or the socket peer."""
+    """Client IP for the per-IP rate limit, resolved for the production topology
+    client -> Cloudflare -> Railway edge -> app (api.paaxmusic.app answers with
+    `Server: cloudflare` + `x-railway-edge`).
+
+    1. `CF-Connecting-IP`: set by Cloudflare from the TCP peer; a client cannot
+       forge it through the proxy. Preferred whenever present.
+    2. Otherwise the RIGHTMOST `X-Forwarded-For` hop: proxies append, so the
+       last entry was written by the trusted edge, while the first entry can be
+       supplied by the client itself (the previous implementation trusted the
+       first hop, which let a caller pick its own bucket).
+    3. Otherwise the socket peer.
+    """
+    cf = request.headers.get("cf-connecting-ip", "").strip()
+    if cf:
+        return cf
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
-        first = fwd.split(",")[0].strip()
-        if first:
-            return first
+        hops = [h.strip() for h in fwd.split(",") if h.strip()]
+        if hops:
+            return hops[-1]
     return request.client.host if request.client else "unknown"
 
 
