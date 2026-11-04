@@ -377,3 +377,42 @@ def test_router_rate_limit_cannot_be_evaded_by_spoofing_first_forwarded_hop(demo
                            headers={"X-Forwarded-For": f"10.0.0.{i}, 203.0.113.9"}).status_code == 201
     r = client.post("/v2/demo/sessions", headers={"X-Forwarded-For": "10.0.0.99, 203.0.113.9"})
     assert r.status_code == 429
+
+
+# ── fail-closed rate limiting ────────────────────────────────────────────────
+
+class _BrokenRedis:
+    async def incr(self, k):
+        raise ConnectionError("redis down")
+
+
+def test_create_fails_closed_when_rate_limit_cannot_be_enforced(demo_client):
+    """Minting identities must never run unlimited: with Redis absent or failing the
+    create endpoint answers 503 DEMO_UNAVAILABLE instead of degrading open."""
+    client, c = demo_client
+    for limiter in (None, RateLimiter(None), RateLimiter(_BrokenRedis())):
+        c.rate_limiter = limiter
+        r = client.post("/v2/demo/sessions")
+        assert r.status_code == 503, limiter
+        assert r.json()["error"]["code"] == "DEMO_UNAVAILABLE"
+        assert r.headers["Retry-After"] == "60"
+    assert c.demo.created == 0
+    # status/end are token-gated, not limiter-gated: still reachable.
+    assert client.get("/v2/demo/sessions/me", headers={"Authorization": "Bearer good"}).status_code == 200
+
+
+def test_create_degrades_open_only_when_explicitly_configured(demo_client, monkeypatch):
+    client, c = demo_client
+    import dataclasses
+    import config
+    monkeypatch.setattr(config, "settings", dataclasses.replace(
+        config.settings, demo_require_rate_limiter=False))
+    c.rate_limiter = RateLimiter(None)
+    assert client.post("/v2/demo/sessions").status_code == 201
+
+
+def test_require_rate_limiter_defaults_on(monkeypatch):
+    import importlib
+    import config
+    monkeypatch.delenv("DEMO_REQUIRE_RATE_LIMITER", raising=False)
+    assert importlib.reload(config).Settings().demo_require_rate_limiter is True

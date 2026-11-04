@@ -130,6 +130,11 @@ class Settings:
     demo_rate_limit_per_ip: int = _env_int("DEMO_RATE_LIMIT_PER_IP", 6)
     demo_rate_limit_window: int = _env_int("DEMO_RATE_LIMIT_WINDOW_SECONDS", 600)
     demo_rate_limit_global: int = _env_int("DEMO_RATE_LIMIT_GLOBAL", 120)
+    # Fail CLOSED when the per-IP/global limits cannot be enforced (Redis not
+    # configured or unreachable): creating a demo session mints a real Supabase
+    # identity, so it must never run unlimited. The catalog endpoints keep their
+    # degrade-open behaviour; this only gates POST /v2/demo/sessions.
+    demo_require_rate_limiter: bool = _env_bool("DEMO_REQUIRE_RATE_LIMITER", True)
     demo_email_domain: str = _env_str("DEMO_EMAIL_DOMAIN", "demo.paaxmusic.app")
     demo_display_name: str = _env_str("DEMO_DISPLAY_NAME", "Demo Visitor")
     demo_web_url: str = _env_str("DEMO_WEB_URL", "https://paaxmusic.app/?demo=1")

@@ -5,9 +5,12 @@ POST /v2/demo/sessions        → mint an isolated 10-minute demo identity
 GET  /v2/demo/sessions/me     → authoritative status for the bearer token
 POST /v2/demo/sessions/end    → end early: mark + delete the identity
 
-Abuse controls: per-IP and global fixed-window rate limits (Redis; degrade
-open like the rest of the API), a kill switch (DEMO_ENABLED), and the CORS
-allowlist from FRONTEND_ORIGINS (the portfolio origin must be listed).
+Abuse controls: per-IP and global fixed-window rate limits (Redis). Unlike the
+catalog endpoints, session CREATION fails CLOSED (503 DEMO_UNAVAILABLE) when the
+limits cannot be enforced — Redis missing or down — because every session mints
+a real Supabase identity (DEMO_REQUIRE_RATE_LIMITER, default true). Plus a kill
+switch (DEMO_ENABLED) and the CORS allowlist from FRONTEND_ORIGINS (the
+portfolio origin must be listed; CORS is a browser courtesy, not the guard).
 Purely additive: no existing endpoint or auth behaviour is touched.
 """
 
@@ -65,16 +68,25 @@ def client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _limiter_unavailable():
+    # Fail closed: minting identities without an enforced limit is not allowed.
+    return _error(503, "DEMO_UNAVAILABLE", "demo sessions are temporarily unavailable",
+                  headers={"Retry-After": "60"})
+
+
 async def _rate_limited(request: Request):
+    settings = _config.settings
     limiter = container.rate_limiter
     if limiter is None:
-        return None
+        return _limiter_unavailable() if settings.demo_require_rate_limiter else None
     ip = client_ip(request)
-    allowed, remaining, reset = await limiter.check(
-        f"demo:create:{ip}", _config.settings.demo_rate_limit_per_ip, _config.settings.demo_rate_limit_window)
-    if allowed:
-        allowed, remaining, reset = await limiter.check(
-            "demo:create:global", _config.settings.demo_rate_limit_global, 3600)
+    allowed, remaining, reset, enforced = await limiter.check_enforced(
+        f"demo:create:{ip}", settings.demo_rate_limit_per_ip, settings.demo_rate_limit_window)
+    if allowed and enforced:
+        allowed, remaining, reset, enforced = await limiter.check_enforced(
+            "demo:create:global", settings.demo_rate_limit_global, 3600)
+    if not enforced and settings.demo_require_rate_limiter:
+        return _limiter_unavailable()
     if not allowed:
         return _error(429, "DEMO_RATE_LIMITED", "too many demo sessions, try again later",
                       headers={"Retry-After": str(reset),
