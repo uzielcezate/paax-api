@@ -23,6 +23,7 @@ from services.catalog.home_service import HomeService
 from services.catalog.jobs import BackgroundJobs
 from services.catalog.playback_service import PlaybackMatchingService
 from services.catalog.search_service import SearchService
+from services.demo.demo_session_service import DemoConfig, DemoSessionService, GoTrueHttp
 from services.rate_limit import RateLimiter
 
 logger = logging.getLogger("paax.container")
@@ -42,6 +43,7 @@ class AppContainer:
         self.search = None
         self.home = None
         self.playback = None
+        self.demo = None
         self.matcher_available = False
 
     async def startup(self, *, redis, deezer) -> None:
@@ -80,7 +82,33 @@ class AppContainer:
                                 deezer=deezer, ingestion=self.ingestion)
         self.playback = PlaybackMatchingService(track_repo=track_repo, jobs=self.jobs,
                                                 catalog_service=self.catalog)
-        logger.info("[container] Phase 2 services ready (matcher=%s)", self.matcher_available)
+        self.demo = self._build_demo()
+        logger.info("[container] Phase 2 services ready (matcher=%s, demo=%s)",
+                    self.matcher_available, self.demo is not None)
+
+    def _build_demo(self):
+        """Portfolio demo sessions — only when Supabase + a public API key are set.
+
+        The public key is SUPABASE_PUBLISHABLE_KEY (preferred) or the legacy
+        SUPABASE_ANON_KEY; see Settings.supabase_public_api_key.
+        """
+        from config import settings
+        if not settings.demo_configured or not hasattr(self.gateway, "auth_admin"):
+            logger.info("[container] demo sessions disabled "
+                        "(DEMO_ENABLED / SUPABASE_PUBLISHABLE_KEY / SUPABASE_ANON_KEY)")
+            return None
+        logger.info("[container] demo token exchange uses the %s key",
+                    settings.supabase_public_api_key_kind)
+        return DemoSessionService(
+            gateway=self.gateway,
+            auth_admin=self.gateway.auth_admin,
+            token_client=GoTrueHttp(settings.supabase_url, settings.supabase_public_api_key),
+            config=DemoConfig(
+                session_seconds=settings.demo_session_seconds,
+                email_domain=settings.demo_email_domain,
+                display_name=settings.demo_display_name,
+            ),
+        )
 
     @property
     def supabase_ready(self) -> bool:
