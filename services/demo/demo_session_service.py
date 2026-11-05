@@ -39,6 +39,52 @@ logger = logging.getLogger("paax.demo")
 
 DEMO_FLAG = "paax_demo"
 
+# ── one-time password generation ─────────────────────────────────────────────
+# The Supabase project's Auth policy (Dashboard → Authentication → Sign In /
+# Providers → Email) is "minimum 8 characters" + "lowercase, uppercase letters,
+# digits and symbols": GoTrue rejects a password missing ANY class with
+# AuthWeakPasswordError. `secrets.token_urlsafe` only ever emits `-`/`_` as
+# symbols, so ~25% of its outputs had no symbol at all and creation failed
+# with 502 (observed in the Stage 5 activation test). The generator below
+# guarantees at least one character of every class, then fills the rest from
+# the union alphabet and shuffles with a CSPRNG. The symbol set is a subset
+# of GoTrue's accepted symbol characters.
+PASSWORD_LENGTH = 40
+_PW_LOWER = "abcdefghijklmnopqrstuvwxyz"
+_PW_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_PW_DIGITS = "0123456789"
+_PW_SYMBOLS = "!@#$%^&*()_+-=[]{}|;:,.<>?"
+_PW_CLASSES = (_PW_LOWER, _PW_UPPER, _PW_DIGITS, _PW_SYMBOLS)
+_PW_ALPHABET = "".join(_PW_CLASSES)
+_SYSRAND = secrets.SystemRandom()
+
+
+def generate_demo_password(length: int = PASSWORD_LENGTH) -> str:
+    """Cryptographically random one-time password that satisfies the Supabase
+    Auth policy: >= 8 chars with at least one lowercase, uppercase, digit and
+    symbol. Never stored, never logged."""
+    if length < max(8, len(_PW_CLASSES)):
+        raise ValueError("password length too short for the required classes")
+    chars = [secrets.choice(cls) for cls in _PW_CLASSES]
+    chars += [secrets.choice(_PW_ALPHABET) for _ in range(length - len(chars))]
+    _SYSRAND.shuffle(chars)
+    return "".join(chars)
+
+
+def password_meets_policy(password: str) -> bool:
+    """True when `password` has >= 8 chars and one of each required class."""
+    return (len(password) >= 8
+            and any(c in _PW_LOWER for c in password)
+            and any(c in _PW_UPPER for c in password)
+            and any(c in _PW_DIGITS for c in password)
+            and any(c in _PW_SYMBOLS for c in password))
+
+
+def _is_weak_password_error(exc: BaseException) -> bool:
+    # supabase-py raises `AuthWeakPasswordError`; match on the type name so the
+    # service keeps working without importing the SDK (tests inject fakes).
+    return "weakpassword" in type(exc).__name__.lower()
+
 
 class DemoError(Exception):
     """Carries an HTTP status + stable error code for the router."""
@@ -159,19 +205,26 @@ class DemoSessionService:
         expires = started + timedelta(seconds=cfg.session_seconds)
         username = f"demo_{secrets.token_hex(4)}"
         email = f"demo-{uuid.uuid4().hex}@{cfg.email_domain}"
-        password = secrets.token_urlsafe(32)  # never stored, never logged
+        password = generate_demo_password()  # never stored, never logged
 
-        try:
-            created = await self._admin.create_user({
-                "email": email,
-                "password": password,
-                "email_confirm": True,
-                "app_metadata": {DEMO_FLAG: True, "demo_client": client},
-                "user_metadata": {"username": username, "display_name": cfg.display_name},
-            })
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[demo] create_user failed: %s", type(exc).__name__)
-            raise DemoError(502, "DEMO_IDENTITY_CREATE_FAILED", "could not create demo identity")
+        # One bounded retry, ONLY for a weak-password rejection (a fresh
+        # password is drawn); every other GoTrue failure surfaces immediately.
+        for attempt in (1, 2):
+            try:
+                created = await self._admin.create_user({
+                    "email": email,
+                    "password": password,
+                    "email_confirm": True,
+                    "app_metadata": {DEMO_FLAG: True, "demo_client": client},
+                    "user_metadata": {"username": username, "display_name": cfg.display_name},
+                })
+                break
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[demo] create_user failed: %s", type(exc).__name__)
+                if attempt == 1 and _is_weak_password_error(exc):
+                    password = generate_demo_password()
+                    continue
+                raise DemoError(502, "DEMO_IDENTITY_CREATE_FAILED", "could not create demo identity")
 
         uid = _user_id(created)
         if not uid:
