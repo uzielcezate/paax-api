@@ -253,7 +253,7 @@ def demo_client(monkeypatch):
 
 def test_router_create_status_end(demo_client):
     client, c = demo_client
-    r = client.post("/v2/demo/sessions", json={"client": "portfolio"})
+    r = client.post("/v2/demo/sessions", json={"client": "portfolio"}, headers={"X-Real-IP": "203.0.113.9"})
     assert r.status_code == 201
     body = r.json()
     assert body["auth"]["refresh_token"] == "rt" and body["launch"]["web_url"].endswith("demo=1")
@@ -269,16 +269,20 @@ def test_router_create_status_end(demo_client):
     assert e.status_code == 200 and c.demo.ended == ["good"]
 
 
-def test_router_rate_limits_per_ip_using_forwarded_header(demo_client):
+def test_router_rate_limits_per_ip_using_edge_real_ip_header(demo_client):
+    """Normal Cloudflare ingress: Railway's edge sets X-Real-IP to the visitor
+    (derived from CF-Connecting-IP); the caller-visible copies are also present
+    but must not matter."""
     client, c = demo_client
-    h = {"X-Forwarded-For": "203.0.113.9, 10.0.0.1"}
+    h = {"X-Real-IP": "203.0.113.9", "CF-Connecting-IP": "203.0.113.9",
+         "X-Forwarded-For": "203.0.113.9, 172.71.0.1"}
     assert client.post("/v2/demo/sessions", headers=h).status_code == 201
     assert client.post("/v2/demo/sessions", headers=h).status_code == 201
     r = client.post("/v2/demo/sessions", headers=h)
     assert r.status_code == 429 and r.json()["error"]["code"] == "DEMO_RATE_LIMITED"
     assert "Retry-After" in r.headers
     # a different visitor is unaffected
-    assert client.post("/v2/demo/sessions", headers={"X-Forwarded-For": "198.51.100.7"}).status_code == 201
+    assert client.post("/v2/demo/sessions", headers={"X-Real-IP": "198.51.100.7"}).status_code == 201
 
 
 def test_router_kill_switch(demo_client, monkeypatch):
@@ -351,32 +355,135 @@ def test_demo_is_disabled_by_default_when_env_unset(monkeypatch):
     assert fresh.demo_configured is False
 
 
-def test_client_ip_prefers_cloudflare_header_and_rightmost_forwarded_hop():
-    """Production topology is client -> Cloudflare -> Railway edge -> app. A caller must not be
-    able to pick its own rate-limit bucket by sending X-Forwarded-For itself."""
-    from api.demo_router import client_ip
+class _Req:
+    """Bare request stand-in for trusted_client_ip unit tests."""
 
-    class _Req:
-        def __init__(self, headers, peer="10.9.9.9"):
-            self.headers = headers
-            self.client = type("C", (), {"host": peer})()
-
-    assert client_ip(_Req({"cf-connecting-ip": "198.51.100.7",
-                           "x-forwarded-for": "1.1.1.1, 198.51.100.7"})) == "198.51.100.7"
-    # spoofed first hop + real client appended by the edge -> the edge's entry wins
-    assert client_ip(_Req({"x-forwarded-for": "1.1.1.1, 203.0.113.9"})) == "203.0.113.9"
-    assert client_ip(_Req({"x-forwarded-for": " 203.0.113.9 "})) == "203.0.113.9"
-    assert client_ip(_Req({})) == "10.9.9.9"
+    def __init__(self, headers, peer="10.9.9.9"):
+        self.headers = headers
+        self.client = type("C", (), {"host": peer})() if peer is not None else None
 
 
-def test_router_rate_limit_cannot_be_evaded_by_spoofing_first_forwarded_hop(demo_client):
+def test_trusted_client_ip_reads_only_the_edge_header():
+    """Topology: client -> Cloudflare -> Railway edge -> app. The ONLY address the
+    caller cannot pre-fill is X-Real-IP (replaced by the Railway edge). Everything
+    the caller can write — CF-Connecting-IP, X-Forwarded-For, the socket peer in
+    production — is ignored."""
+    from api.demo_router import trusted_client_ip
+
+    # normal Cloudflare ingress: X-Real-IP already carries the visitor
+    assert trusted_client_ip(_Req({"x-real-ip": "198.51.100.7",
+                                   "cf-connecting-ip": "198.51.100.7",
+                                   "x-forwarded-for": "198.51.100.7, 172.71.0.1"})) == "198.51.100.7"
+    # direct-to-Railway-edge path: the caller forges Cloudflare's header, but the
+    # edge wrote X-Real-IP from the real socket -> the real address wins
+    assert trusted_client_ip(_Req({"x-real-ip": "203.0.113.9",
+                                   "cf-connecting-ip": "1.1.1.1",
+                                   "x-forwarded-for": "1.1.1.1, 2.2.2.2"})) == "203.0.113.9"
+    assert trusted_client_ip(_Req({"x-real-ip": " 203.0.113.9 "})) == "203.0.113.9"
+    # caller-controlled headers alone never produce an identity
+    assert trusted_client_ip(_Req({"cf-connecting-ip": "198.51.100.7"})) is None
+    assert trusted_client_ip(_Req({"x-forwarded-for": "198.51.100.7"})) is None
+    assert trusted_client_ip(_Req({})) is None                      # socket peer ignored
+    assert trusted_client_ip(_Req({}, peer=None)) is None
+
+
+def test_trusted_client_ip_rejects_malformed_values_and_buckets_ipv6_per_64():
+    from api.demo_router import trusted_client_ip
+
+    for bad in ("", "   ", "not-an-ip", "203.0.113.9, 10.0.0.1", "203.0.113.9:443",
+                "999.1.1.1", "2001:db8::1, 2001:db8::2", "203.0.113.0/24"):
+        assert trusted_client_ip(_Req({"x-real-ip": bad})) is None, bad
+    # IPv6 visitors are keyed on their /64 so rotating interface ids is free no more
+    a = trusted_client_ip(_Req({"x-real-ip": "2001:db8:abcd:12::1"}))
+    b = trusted_client_ip(_Req({"x-real-ip": "2001:db8:abcd:12:ffff::9"}))
+    other = trusted_client_ip(_Req({"x-real-ip": "2001:db8:abcd:13::1"}))
+    assert a == b == "2001:db8:abcd:12::/64" and other != a
+    assert trusted_client_ip(_Req({"x-real-ip": "::ffff:203.0.113.9"})) is not None
+
+
+def test_trusted_client_ip_socket_peer_only_when_header_disabled(monkeypatch):
+    """DEMO_CLIENT_IP_HEADER='' is the local-development escape hatch (no edge in
+    front). It must be an explicit opt-in, never the default fallback."""
+    import dataclasses
+    import config
+    from api.demo_router import trusted_client_ip
+
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, demo_client_ip_header=""))
+    assert trusted_client_ip(_Req({"cf-connecting-ip": "1.1.1.1"}, peer="127.0.0.1")) == "127.0.0.1"
+    assert trusted_client_ip(_Req({}, peer="testclient")) is None     # still validated
+    assert trusted_client_ip(_Req({}, peer=None)) is None
+
+
+def test_router_rate_limit_cannot_be_evaded_by_forged_forwarding_headers(demo_client):
+    """Same real client (X-Real-IP constant, as the edge writes it) rotating forged
+    CF-Connecting-IP / X-Forwarded-For values on every call still hits the limit."""
     client, c = demo_client
-    # Same real client (rightmost hop) rotating a fake first hop on every call
     for i in range(2):
         assert client.post("/v2/demo/sessions",
-                           headers={"X-Forwarded-For": f"10.0.0.{i}, 203.0.113.9"}).status_code == 201
-    r = client.post("/v2/demo/sessions", headers={"X-Forwarded-For": "10.0.0.99, 203.0.113.9"})
-    assert r.status_code == 429
+                           headers={"X-Real-IP": "203.0.113.9",
+                                    "CF-Connecting-IP": f"10.0.0.{i}",
+                                    "X-Forwarded-For": f"10.0.0.{i}, 10.1.1.{i}"}).status_code == 201
+    r = client.post("/v2/demo/sessions", headers={"X-Real-IP": "203.0.113.9",
+                                                 "CF-Connecting-IP": "10.0.0.99",
+                                                 "X-Forwarded-For": "10.0.0.99"})
+    assert r.status_code == 429 and c.demo.created == 2
+
+
+def test_router_fails_closed_without_trusted_client_identity(demo_client, caplog):
+    """No X-Real-IP (request did not cross the public edge, or the edge contract
+    changed) or a malformed one: 503, nothing minted, and the address is never
+    logged. Forged caller headers do not substitute for the missing identity."""
+    import logging
+    client, c = demo_client
+    with caplog.at_level(logging.WARNING, logger="paax.demo"):
+        for h in ({}, {"CF-Connecting-IP": "198.51.100.7"}, {"X-Forwarded-For": "198.51.100.7"},
+                  {"X-Real-IP": "198.51.100.7, 10.0.0.1"}, {"X-Real-IP": "garbage"},
+                  {"X-Real-IP": "unknown"}):
+            r = client.post("/v2/demo/sessions", headers=h)
+            assert r.status_code == 503, h
+            assert r.json()["error"]["code"] == "DEMO_UNAVAILABLE"
+            assert r.headers["Retry-After"] == "60"
+    assert c.demo.created == 0
+    assert "198.51.100.7" not in caplog.text and "garbage" not in caplog.text
+    assert "client identity untrusted" in caplog.text
+    # /me and /end are token-gated, not identity-gated
+    assert client.get("/v2/demo/sessions/me", headers={"Authorization": "Bearer good"}).status_code == 200
+
+
+def test_router_global_limit_still_applies_across_distinct_trusted_ips(demo_client, monkeypatch):
+    import dataclasses
+    import config
+    client, c = demo_client
+    monkeypatch.setattr(config, "settings", dataclasses.replace(
+        config.settings, demo_enabled=True, demo_rate_limit_per_ip=100, demo_rate_limit_global=3))
+    for i in range(3):
+        assert client.post("/v2/demo/sessions", headers={"X-Real-IP": f"203.0.113.{i}"}).status_code == 201
+    r = client.post("/v2/demo/sessions", headers={"X-Real-IP": "203.0.113.200"})
+    assert r.status_code == 429 and c.demo.created == 3
+
+
+def test_router_disabled_wins_over_identity_and_limiter(demo_client, monkeypatch):
+    """Kill switch is checked first: with DEMO_ENABLED=false even a perfectly
+    trusted request gets DEMO_DISABLED (what production answers today)."""
+    import dataclasses
+    import config
+    client, c = demo_client
+    monkeypatch.setattr(config, "settings", dataclasses.replace(config.settings, demo_enabled=False))
+    for h in ({"X-Real-IP": "203.0.113.9"}, {}):
+        r = client.post("/v2/demo/sessions", headers=h)
+        assert r.status_code == 503 and r.json()["error"]["code"] == "DEMO_DISABLED"
+    assert c.demo.created == 0
+
+
+def test_client_ip_header_defaults_to_x_real_ip(monkeypatch):
+    import importlib
+    import config
+    monkeypatch.delenv("DEMO_CLIENT_IP_HEADER", raising=False)
+    assert importlib.reload(config).Settings().demo_client_ip_header == "x-real-ip"
+    monkeypatch.setenv("DEMO_CLIENT_IP_HEADER", "X-Real-IP")
+    assert importlib.reload(config).Settings().demo_client_ip_header == "x-real-ip"
+    monkeypatch.delenv("DEMO_CLIENT_IP_HEADER", raising=False)
+    importlib.reload(config)
 
 
 # ── fail-closed rate limiting ────────────────────────────────────────────────
@@ -408,7 +515,9 @@ def test_create_degrades_open_only_when_explicitly_configured(demo_client, monke
     monkeypatch.setattr(config, "settings", dataclasses.replace(
         config.settings, demo_require_rate_limiter=False))
     c.rate_limiter = RateLimiter(None)
-    assert client.post("/v2/demo/sessions").status_code == 201
+    assert client.post("/v2/demo/sessions", headers={"X-Real-IP": "203.0.113.9"}).status_code == 201
+    # the identity requirement is NOT relaxed by DEMO_REQUIRE_RATE_LIMITER=false
+    assert client.post("/v2/demo/sessions").status_code == 503
 
 
 def test_require_rate_limiter_defaults_on(monkeypatch):
