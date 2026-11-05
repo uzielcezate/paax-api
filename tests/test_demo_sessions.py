@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import secrets
+import string
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,7 +12,8 @@ from fastapi.testclient import TestClient
 import app_container
 from main import app
 from services.demo.demo_session_service import (
-    DEMO_FLAG, DemoConfig, DemoError, DemoSessionService,
+    DEMO_FLAG, PASSWORD_LENGTH, DemoConfig, DemoError, DemoSessionService,
+    generate_demo_password, password_meets_policy,
 )
 from services.rate_limit import RateLimiter
 from tests.conftest import FakeGateway
@@ -144,6 +147,125 @@ async def test_create_maps_gotrue_failure():
     with pytest.raises(DemoError) as exc:
         await svc.create()
     assert exc.value.status == 502 and exc.value.code == "DEMO_IDENTITY_CREATE_FAILED"
+
+
+# ── one-time password policy (Supabase: >= 8 chars, lower+upper+digit+symbol) ─
+
+_ALLOWED_PW_CHARS = set(string.ascii_letters + string.digits + "!@#$%^&*()_+-=[]{}|;:,.<>?")
+
+
+def test_generated_passwords_always_satisfy_the_supabase_policy():
+    seen = set()
+    for _ in range(5000):
+        pw = generate_demo_password()
+        assert len(pw) == PASSWORD_LENGTH >= 8
+        assert password_meets_policy(pw), "missing a required character class"
+        assert set(pw) <= _ALLOWED_PW_CHARS
+        seen.add(pw)
+    assert len(seen) == 5000, "passwords must be unique (CSPRNG)"
+
+
+def test_generated_passwords_are_not_deterministic():
+    assert generate_demo_password() != generate_demo_password()
+
+
+def test_generate_demo_password_rejects_lengths_that_cannot_hold_every_class():
+    with pytest.raises(ValueError):
+        generate_demo_password(7)
+
+
+def test_policy_checker_matches_the_dashboard_rules():
+    assert password_meets_policy("aB3!aB3!")
+    assert not password_meets_policy("aB3!aB3")          # < 8
+    assert not password_meets_policy("ab3!ab3!ab3!")     # no uppercase
+    assert not password_meets_policy("AB3!AB3!AB3!")     # no lowercase
+    assert not password_meets_policy("aBc!aBc!aBc!")     # no digit
+    assert not password_meets_policy("aB3aB3aB3aB3")     # no symbol
+    assert not password_meets_policy(secrets.token_urlsafe(32).replace("-", "a").replace("_", "a"))
+
+
+def test_regression_token_urlsafe_did_not_satisfy_the_policy_reliably():
+    # The previous generator: only `-`/`_` count as symbols, so a noticeable
+    # share of outputs had none. This is why creation returned 502 in production.
+    misses = sum(not password_meets_policy(secrets.token_urlsafe(32)) for _ in range(400))
+    assert misses > 0
+
+
+class AuthWeakPasswordError(Exception):
+    """Name mirrors supabase-py's exception; the service matches on the type name."""
+
+
+class WeakOnceAdmin(FakeAdmin):
+    def __init__(self, weak_times=1):
+        super().__init__()
+        self.weak_times = weak_times
+        self.attempts = []
+
+    async def create_user(self, attributes):
+        self.attempts.append(attributes["password"])
+        if len(self.attempts) <= self.weak_times:
+            raise AuthWeakPasswordError("Password should contain at least one character of each: ...")
+        return await super().create_user(attributes)
+
+
+async def test_create_user_gets_a_policy_compliant_password_and_the_grant_uses_the_same_one():
+    svc, gw, admin, tokens, clock = _service()
+    await svc.create()
+    _, attrs = admin.created[0]
+    assert password_meets_policy(attrs["password"])
+    assert tokens.granted[0] == (attrs["email"], attrs["password"])
+
+
+async def test_create_retries_exactly_once_on_weak_password_with_a_fresh_password(caplog):
+    admin = WeakOnceAdmin(weak_times=1)
+    svc, gw, admin, tokens, clock = _service(admin=admin)
+    with caplog.at_level("WARNING", logger="paax.demo"):
+        out = await svc.create()
+    assert len(admin.attempts) == 2 and admin.attempts[0] != admin.attempts[1]
+    assert all(password_meets_policy(p) for p in admin.attempts)
+    assert len(admin.created) == 1 and admin.deleted == []            # exactly one identity, no orphan
+    assert tokens.granted[0][1] == admin.attempts[1]                   # grant uses the accepted password
+    assert out["session"]["id"] == admin.created[0][0]
+    # the warning names the error type only — never the password
+    assert "AuthWeakPasswordError" in caplog.text
+    for p in admin.attempts:
+        assert p not in caplog.text and p not in str(out)
+
+
+async def test_create_does_not_retry_weak_password_more_than_once():
+    admin = WeakOnceAdmin(weak_times=5)
+    svc, gw, admin, tokens, clock = _service(admin=admin)
+    with pytest.raises(DemoError) as exc:
+        await svc.create()
+    assert exc.value.status == 502 and exc.value.code == "DEMO_IDENTITY_CREATE_FAILED"
+    assert len(admin.attempts) == 2 and admin.created == [] and admin.deleted == []
+    assert tokens.granted == []
+
+
+async def test_create_does_not_retry_other_gotrue_failures():
+    class CountingFailAdmin(FakeAdmin):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def create_user(self, attributes):
+            self.calls += 1
+            raise RuntimeError("gotrue down")
+
+    admin = CountingFailAdmin()
+    svc, *_ = _service(admin=admin, trigger_profiles=False)
+    with pytest.raises(DemoError):
+        await svc.create()
+    assert admin.calls == 1
+
+
+async def test_create_after_weak_password_retry_still_rolls_back_on_later_failure():
+    admin = WeakOnceAdmin(weak_times=1)
+    svc, gw, admin, tokens, clock = _service(admin=admin, tokens=FakeTokens(fail_grant=True))
+    with pytest.raises(DemoError) as exc:
+        await svc.create()
+    assert exc.value.code == "DEMO_TOKEN_EXCHANGE_FAILED"
+    assert len(admin.created) == 1 and admin.deleted == [admin.created[0][0]]   # no orphan identity
 
 
 async def test_status_is_server_authoritative_and_expires():
