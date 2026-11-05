@@ -135,6 +135,13 @@ class Settings:
     # identity, so it must never run unlimited. The catalog endpoints keep their
     # degrade-open behaviour; this only gates POST /v2/demo/sessions.
     demo_require_rate_limiter: bool = _env_bool("DEMO_REQUIRE_RATE_LIMITER", True)
+    # Header carrying the per-visitor identity for the demo-creation limit. It
+    # must be written by the edge in front of the app and NOT be pre-fillable by
+    # the caller: on Railway that is `X-Real-IP` (replaced by the public HTTP
+    # edge; derived from Cloudflare's CF-Connecting-IP when Cloudflare is the
+    # peer). Never point this at CF-Connecting-IP or X-Forwarded-For, which
+    # reach the app caller-controlled. Empty = socket peer (local dev only).
+    demo_client_ip_header: str = _env_str("DEMO_CLIENT_IP_HEADER", "x-real-ip").lower()
     demo_email_domain: str = _env_str("DEMO_EMAIL_DOMAIN", "demo.paaxmusic.app")
     demo_display_name: str = _env_str("DEMO_DISPLAY_NAME", "Demo Visitor")
     demo_web_url: str = _env_str("DEMO_WEB_URL", "https://paaxmusic.app/?demo=1")
